@@ -520,6 +520,24 @@ an example:
 
 ```
 
+### A better alternative to type-safe proxy for the API
+
+The interface-based proxy that is available in `Retorfit`, `Jersey` and `RestClient` is a very convenient way to
+work with the API. However, it's not always the best way to do it. Lots of APIs are documented with OpenAPI/Swagger,
+and there are tools that can generate the client code for you.
+
+Some time ago I wrote an article about how to use `openapi-generator` to generate the client code for testing your
+server-side code. You can find it here: https://medium.com/duda/cleaner-spring-boot-it-rest-tests-with-client-generation-cc3ac880d9ec
+
+Main benefit of using the generated client code is zero manually written code. Components that you will use will be 
+generated from the API definition that server-side team provides for you. This means that you can replace tests with 
+mock-server with tests on Mockito mocks, or even subclassed mock-reimplementations to support integration cases.
+
+If you are the one who is responsible for the API, you should also consider investing time into properly documenting 
+the API so that its consumers can generate the client code for it in any language they want. Also, if you store the
+generated schema in the version control system, you can see the changes in the API and will make sure that the schema
+doesn't introduce accidental breaking changes to consumers that use it for generating the client code.
+
 ## Spring's test kit for RestTemplate / RestClient
 
 A significant advantage of using `RestTemplate` or `RestClient` is that Spring provides a built-in support for testing
