@@ -1247,6 +1247,529 @@ to your needs. You can also use `RestTemplateBuilder` to build a `RestTemplate` 
     }
 ```
 
+## Deeper exploring of non-happy-path scenarios with timeouts
+
+In the previous examples, we've seen how to test the happy path of the code that makes HTTP calls. But what if 
+thing will go really wrong, and our application relies on making HTTP calls to external services a lot? An example
+of "wrong" can not even be programming errors, but also network issues that result in very slow bandwidth, high latency
+and all the other things that can happen in the real world.
+
+Let's build a simple setup that will give us some control over behavior that is configured in http client. E.g.,
+we want to be able to deeper mock "the other side" (unfortunately, ```MockServer``` doesn't provide full flexibility here): 
+- ```requestTimeout``` -- the time for server to start responding to the request  
+- ```socketTimeout``` -- the time between packets of data being received
+
+Following setup allows us to return the response with a delay, and also to pause between sending slices of the response.
+Keep in mind that this is just a very limited simulation, later in the article I'll show you a much 
+better tool for this purpose.
+
+```
+/**
+ * Calls to our application need to come via http, so we need to start a server.
+ */
+@SpringBootTest(
+        webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT
+)
+@Slf4j
+public class GGG_WhenThingsGoNotAsPlanned {
+
+    /**
+     * The excludes of auto-configurations are just to start the context,
+     * since the repository has various spring-boot-starters for other examples.
+     * They are not related to the content of this class.
+     */
+    @SpringBootApplication(
+            exclude = {
+                    MongoAutoConfiguration.class,
+                    MongoDataAutoConfiguration.class,
+                    RedisAutoConfiguration.class,
+                    JdbcRepositoriesAutoConfiguration.class,
+                    DataSourceAutoConfiguration.class
+            }
+    )
+    static class NetworkCasesEmulatingController {
+
+        @RestController
+        static class TheTestController {
+
+            List<String> slices = List.of(
+                    "[{",
+                    "  \"name\": \"First\"",
+                    "},",
+                    "{",
+                    "  \"name\": \"Second\"",
+                    "},",
+                    "{",
+                    "  \"name\": \"Third\"",
+                    "}]"
+            );
+
+            // delay and pause allow us to simulate slow and sliced response
+            @GetMapping("/sliced-endpoint")
+            public void returnSlicedResponseAccordingToRequest(
+                    @RequestParam(required = false, defaultValue = "0") Long delay,
+                    @RequestParam(required = false, defaultValue = "0") Long pause,
+                    HttpServletResponse response
+            ) throws Exception {
+                Thread.sleep(delay);
+                response.setContentType("application/json");
+                PrintWriter writer = response.getWriter();
+                for (int i = 0; i < slices.size(); i++) {
+                    Thread.sleep(pause);
+                    var nextLine = slices.get(i);
+                    log.debug("Sending: {}", nextLine);
+                    writer.println(nextLine);
+                    writer.flush();
+                }
+            }
+
+            @GetMapping
+            public String returnGivenAmountOfData(
+                    @RequestParam Long kilobytes
+            ) {
+                return StringUtils.repeat("a", (int) (kilobytes * 1024));
+            }
+
+        }
+    }
+    
+    @LocalServerPort
+    int serverPort;
+    
+```
+
+This is how our RestTemplate configuration will look like. Essentially, we're setting the timeouts to 1 second
+into everything, because we expect all the requests to be fast.
+
+```
+    private static RestTemplate buildRestTemplateWithLimits() {
+        return buildRestTemplateWithLimits(
+                Timeout.ofSeconds(1), Timeout.ofSeconds(2)
+        );
+    }
+
+
+    private static RestTemplate buildRestTemplateWithLimits(
+            Timeout socketTimeout, Timeout responseTimeout
+    ) {
+        return new RestTemplateBuilder()
+                .requestFactory(() -> {
+                    PoolingHttpClientConnectionManager connectionManager = PoolingHttpClientConnectionManagerBuilder.create()
+                            .setDefaultConnectionConfig(
+                                    ConnectionConfig.custom()
+                                            .setSocketTimeout(socketTimeout)
+                                            .setConnectTimeout(Timeout.ofSeconds(1))
+                                            .build()
+                            )
+                            .build();
+                    return new HttpComponentsClientHttpRequestFactory(
+                            HttpClients.custom()
+                                    .setConnectionManager(connectionManager)
+                                    .setDefaultRequestConfig(
+                                            RequestConfig.custom()
+                                                    .setConnectionRequestTimeout(Timeout.ofSeconds(1))
+                                                    .setResponseTimeout(responseTimeout)
+                                                    .build()
+                                    )
+                                    .build()
+                    );
+                }).build();
+    }
+```
+
+First, I'd like to clarify how `socketTimeout` and `responseTimeout` are related to each other in integration.
+The `socketTimeout` is the configuration of connection pool manager, and `responseTimeout` is the configuration
+of the internal client instance. If set, response timeout will override the socket timeout. This means that 
+`responseTimeout` is optional, but it defines the actual maximum wait time between bytes of data being received.
+
+```
+    /**
+     * see {@link org.apache.hc.client5.http.impl.classic.InternalExecRuntime#execute(String, ClassicHttpRequest, HttpClientContext)}
+     */
+    @Test
+    void clientResponseTimeout_overridesConnPoolManagerSocketTimeout() throws Exception {
+        var socketLessThanResponse = buildRestTemplateWithLimits(
+                // socket timeout
+                Timeout.ofMilliseconds(200),
+                // response timeout
+                Timeout.ofMilliseconds(500)
+        );
+
+        String response = socketLessThanResponse.getForObject(
+                "http://localhost:{port}/sliced-endpoint?delay=300", String.class, serverPort
+        );
+        JSONAssert.assertEquals(
+                "[{\"name\":\"First\"},{\"name\":\"Second\"},{\"name\":\"Third\"}]",
+                response, true
+        );
+
+        assertThatThrownBy(() -> {
+            socketLessThanResponse.getForObject(
+                    "http://localhost:{port}/sliced-endpoint?delay=600", String.class, serverPort
+            );
+        }).isInstanceOf(ResourceAccessException.class)
+                .hasCauseInstanceOf(SocketTimeoutException.class)
+                .hasMessageContaining("Read timed out");
+
+
+        var responseLessThanSocket = buildRestTemplateWithLimits(
+                // socket timeout
+                Timeout.ofMilliseconds(500),
+                // response timeout
+                Timeout.ofMilliseconds(200)
+        );
+
+        // even though we set socket timeout to 500ms, the actual limit comes from response timeout
+        assertThatThrownBy(() -> {
+            responseLessThanSocket.getForObject(
+                    "http://localhost:{port}/sliced-endpoint?pause=300", String.class, serverPort
+            );
+        }).isInstanceOf(ResourceAccessException.class)
+                .hasCauseInstanceOf(SocketTimeoutException.class)
+                .hasMessageContaining("Read timed out");
+    }
+```
+
+Now, let's imagine that delay and pause are just below our timeout, and as you can see, we will get full response, 
+but it will take much more time than we expect.
+
+```
+    @Test
+    void timeoutsOnRestTemplateMayNotBeEnough() throws Exception {
+        var restTemplateWithTimeout = buildRestTemplateWithLimits();
+
+        // now let's see what happens when we set both
+        // initial delay and inter-line delay to 900ms
+        StopWatch stopWatch = new StopWatch();
+        stopWatch.start();
+        // making such request will succeed, and we'll get the response
+        var responseEntity = restTemplateWithTimeout.getForObject(
+                "http://localhost:{port}/sliced-endpoint?pause=900&delay=900", String.class,
+                serverPort
+        );
+
+        JSONAssert.assertEquals(
+                "[{\"name\":\"First\"},{\"name\":\"Second\"},{\"name\":\"Third\"}]",
+                responseEntity, true
+        );
+        stopWatch.stop();
+
+        // as long as we kept receiving data with intervals less than the timeout,
+        // overall time can be much longer than the timeout and then you expect
+        double time = stopWatch.getTotalTime(TimeUnit.SECONDS);
+        assertThat(time).isBetween(7.5, 9.0);
+    }
+```
+
+The controller that we've built is a "kindergarten" version that allows us to simulate some of the network issues.
+In real world, you would expect to check how your real application behaves under different network conditions, so 
+having such controllers is not an option. Instead, you can the tool called
+[Toxiproxy](https://github.com/Shopify/toxiproxy) that allows you to simulate network issues in a very flexible way.
+
+It also comes as a [TestContainer](https://java.testcontainers.org/modules/toxiproxy/), so you can easily start using
+it. The documentation for setup and usage is very good, and provides multiple examples. I will just show very basic
+usage of it.
+
+Here is sample code that allows toxiproxy container to call our upstream server running on localhost - and
+the ```ToxiProxySetup``` record will contain all the information for us to make calls to 
+our server via toxiproxy.
+
+```
+    ToxiproxyContainer toxiproxy = new ToxiproxyContainer("ghcr.io/shopify/toxiproxy:2.5.0")
+            .withLogConsumer(new Slf4jLogConsumer(log));
+    
+    record ToxiProxySetup(
+            String host,
+            int port,
+            Proxy proxy
+    ) {
+        
+    }
+
+    /**
+     * See documentation of TestContainers for more details on how to configure 
+     * networks in various cases.
+     */
+    private ToxiProxySetup setupToxiProxy() throws IOException {
+        Testcontainers.exposeHostPorts(serverPort);
+        toxiproxy.start();
+
+        log.info("Server port: {}", serverPort);
+        ToxiproxyClient toxiproxyClient = new ToxiproxyClient(toxiproxy.getHost(), toxiproxy.getControlPort());
+        Proxy proxy = toxiproxyClient.createProxy(
+                "sliced-response", "0.0.0.0:8666",
+                "host.testcontainers.internal:" + serverPort
+        );
+        String proxyHost = toxiproxy.getHost();
+        int proxyPort = toxiproxy.getMappedPort(8666);
+        log.info("Toxiproxy port: {} & IP: {}", proxyPort, proxyHost);
+
+        return new ToxiProxySetup(proxyHost, proxyPort, proxy);
+    }
+```
+
+And now let's execute the same case of receiving sliced response, but now we will use toxiproxy to simulate the
+delays. 
+
+```
+    @Test
+    void betterWayOfMockingSlicedBehaviorIsUsingToxiProxySlicer() throws Exception {
+        ToxiProxySetup setup = setupToxiProxy();
+
+        setup.proxy().toxics().slicer(
+                "slice", ToxicDirection.DOWNSTREAM,
+                // size in bytes of the slice
+                10,
+                // delay between slices in microseconds
+                90000
+        );
+
+        var restTemplateWithTimeout = buildRestTemplateWithLimits();
+
+        StopWatch stopWatch = new StopWatch();
+        stopWatch.start();
+        // now server will respond quickly, but the client will receive the response
+        // in slices with 900ms delay between them
+        var responseEntity = restTemplateWithTimeout
+                .getForObject("http://{ip}:{port}/sliced-endpoint", String.class,
+                        setup.host(), setup.port()
+                );
+        JSONAssert.assertEquals(
+                "[{\"name\":\"First\"},{\"name\":\"Second\"},{\"name\":\"Third\"}]",
+                responseEntity, true
+        );
+        stopWatch.stop();
+
+        // and overall time will be way about timeouts that we set 
+        double time = stopWatch.getTotalTime(TimeUnit.SECONDS);
+        assertThat(time).isBetween(4.0, 5.0);
+    }
+```
+
+Now let's check out the toxirpoxy's "poison" that allows us to simulate slow bandwidth. 
+In this case, we will call the endpoint that returns 12kb of data, and we will limit the bandwidth to 2kb/s.
+
+As you can see, the that we have are not enough to protect us from the slow network.
+
+```
+    @Test
+    void somethingCanHappenOnNetworkLevelThatWillCauseResponseToBeReturnedForever() throws Exception {
+        ToxiProxySetup setup = setupToxiProxy();
+
+        setup.proxy().toxics().bandwidth("slow-down", ToxicDirection.DOWNSTREAM,
+                // rate in kilobytes per second
+                2);
+
+        var restTemplateWithTimeout = buildRestTemplateWithLimits();
+        // call the "fast" endpoint that returns 12kb of data
+        StopWatch stopWatch = new StopWatch();
+        stopWatch.start();
+        String response = restTemplateWithTimeout.getForObject(
+                "http://{ip}:{port}?kilobytes=12", String.class,
+                setup.host(), setup.port()
+        );
+
+        assertThat(response).hasSize(12 * 1024);
+        stopWatch.stop();
+        double time = stopWatch.getTotalTime(TimeUnit.SECONDS);
+        assertThat(time).isBetween(6.0, 7.0);
+    }
+```
+
+## Hard solution for slow requests
+
+The previous examples show us that none of the timeouts that we set on the `RestTemplate` via underlying `Apache HttpClient` 
+are enough to limit full request execution time. In most cases API calls are expected to be fast, and if they are not,
+it can cause issues in the application and can affect the user experience. Quite often, it's better to fail (and show 
+a message that service is not available) than to wait for a long time and then still fail on some gateway timeout.
+
+Unfortunately, `Apache HttpClient` does not provide a way to set a hard timeout on the request execution directly,
+but it provides apis to cancel the request execution. However, since the "native" client 
+is hidden behind the abstractions of `spring-web`(`RestTemplate` and `ClientHttpRequest`), and it's not easy to access the 
+`HttpGet/HttpPost` instance and cancel the request. It requires some reflection magic, and looks a bit dangerous.
+
+In this example, we wrap the `ClientHttpRequestFactory` that is used by `RestTemplate` and schedule the canceling
+of the request after a certain time. This way, we can set a hard timeout on the request execution.
+
+```
+    @SneakyThrows
+    private static ClientHttpRequest requestWithHardTimeout(
+            ClientHttpRequest request,
+            int timeout, TimeUnit timeoutTimeUnit
+    ) {
+        AbstractClientHttpRequest clientRequest = (AbstractClientHttpRequest) request;
+        // get field "httpRequest" from the request
+        Field reqField = ReflectionUtils.findField(request.getClass(), "httpRequest");
+        ReflectionUtils.makeAccessible(reqField);
+        HttpUriRequestBase apacheHttpRequest = (HttpUriRequestBase) reqField.get(clientRequest);
+        // schedule canceling the request after provided timeout
+        log.info("Scheduling hard cancel in {} {}", timeout, timeoutTimeUnit);
+        Executors.newSingleThreadScheduledExecutor()
+                .schedule(() -> {
+                    log.info("Hard cancelling the request");
+                    apacheHttpRequest.abort();
+                }, timeout, timeoutTimeUnit);
+        return request;
+    }
+
+    @Test
+    void settingHardLimit_viaAbortingNativeRequest() {
+        var restTemplateWithTimeout = buildRestTemplateWithLimits();
+
+        HttpComponentsClientHttpRequestFactory apacheClientFactory = (HttpComponentsClientHttpRequestFactory)
+                restTemplateWithTimeout.getRequestFactory();
+
+        ClientHttpRequestFactory factoryWithHardTimeout = (uri, httpMethod) -> {
+            var request = apacheClientFactory.createRequest(uri, httpMethod);
+            return requestWithHardTimeout(request, 3, TimeUnit.SECONDS);
+        };
+        restTemplateWithTimeout.setRequestFactory(factoryWithHardTimeout);
+
+        // now let's see what happens when we set inter-line delay to 900ms
+        assertThatExceptionOfType(RestClientException.class).isThrownBy(() -> {
+                    restTemplateWithTimeout.getForObject("http://localhost:{port}/sliced-endpoint?delay=800",
+                            String.class, serverPort);
+                }).havingCause()
+                .isInstanceOf(SocketException.class)
+                .withMessage("Socket closed");
+    }
+    
+```
+
+You might hear some arguments that using reactive approach with async http client is a good way to handle long calls, 
+but in my opinion, it's not always the case.
+- there might be a live user on the other side of the request that can't wait for a long time
+- if you know that your requests are expected to be fast, long calls are a sign of a problem
+on the server side. Imagine that eventually all the thousands of async requests will be processed, 
+and you will need to do something with the result (e.g. load response body into memory, 
+save to the database, call another service). Will everything go well in this case?
+
+E.g., if you have a service that is expected to respond in 100ms, and it starts to respond in 10 seconds,
+making additional calls (even in nice async manner) will not make the target service any good. The typical pattern 
+in distributed systems is to stop calling the service that misbehaves until it recovers, and its is called "circuit breaker".
+
+Java has a library called `resilience4j` that provides implementations of many patterns for building resilient applications, 
+and it provides an amazing implementation of the circuit breaker [Resilience4j](https://resilience4j.readme.io/docs/circuitbreaker).
+Thus, we can use the circuit breaker to extend our `RestTemplate` via `ClientHttpRequestInterceptor` to prevent
+calls to degraded service.
+
+Pay attention that `CircuitBreaker` has a very flexible and thus non-trivial configuration, and you should
+test the behavior of your circuit breaker to make sure that it acts as you expect it to act. Else you can end up
+having your circuit breaker in open state even when the initial problem is already resolved. Luckily, `resilience4j`
+also provides a lot of extension point for monitoring the circuit breaker state and events.
+
+```
+    @Test
+    void whenSomethingGoesWrongConsistently_weShouldShortCircuitCalls() {
+        // let's imagine that service consistently returns slow responses
+        // via our "native" sliced endpoint
+
+        RestTemplate restTemplate = buildRestTemplateWithLimits();
+        restTemplate.getForObject(
+                "http://localhost:{port}/sliced-endpoint?delay=400",
+                String.class, serverPort
+        );
+
+        CircuitBreaker circuitBreaker = CircuitBreaker.of(
+                "slow-service", CircuitBreakerConfig.custom()
+                        .slowCallDurationThreshold(Duration.ofMillis(200))
+                        .slowCallRateThreshold(90)
+                        .minimumNumberOfCalls(4)
+                        .slidingWindowSize(10)
+                        .slidingWindowType(COUNT_BASED)
+                        .waitDurationInOpenState(Duration.ofSeconds(1))
+                        .enableAutomaticTransitionFromOpenToHalfOpen()
+                        .permittedNumberOfCallsInHalfOpenState(1)
+                        .maxWaitDurationInHalfOpenState(Duration.ofSeconds(2))
+                        .build()
+        );
+        circuitBreaker.getEventPublisher().onStateTransition(event -> {
+            log.info("Circuit breaker state transition: {}", event);
+        });
+
+        ClientHttpRequestInterceptor interceptor = (request, body, execution) -> {
+            log.info("Current state: {}", circuitBreaker.getState());
+            try {
+                return circuitBreaker.executeCheckedSupplier(() -> {
+                    ClientHttpResponse executed = execution.execute(request, body);
+                    log.info("Call was executed successfully");
+                    return executed;
+                });
+            } catch (Throwable e) {
+                // request interceptor's contract is to throw IOException
+                throw e instanceof IOException
+                        ? (IOException) e
+                        : new IOException(e);
+            }
+        };
+        restTemplate.getInterceptors().add(interceptor);
+
+        // the behavior of rest template is now changed
+
+        // first 3 calls will be slow, but they will succeed
+        for (int i = 0; i < 4; i++) {
+            assertThatCode(() -> restTemplate.getForObject(
+                    "http://localhost:{port}/sliced-endpoint?delay=400",
+                    String.class, serverPort
+            )).doesNotThrowAnyException();
+        }
+
+        // but if we make 4th, 5th, 6th and 7th call - they will fail
+        for (int i = 0; i < 4; i++) {
+            assertThatExceptionOfType(ResourceAccessException.class).isThrownBy(() -> {
+                        restTemplate.getForObject(
+                                "http://localhost:{port}/sliced-endpoint?delay=400",
+                                String.class, serverPort
+                        );
+                    }).havingRootCause().isInstanceOf(CallNotPermittedException.class)
+                    .withMessageContaining("CircuitBreaker 'slow-service' is OPEN");
+        }
+
+        // e.g. the circuit breaker is now in open state
+        assertThat(circuitBreaker.getState()).isEqualTo(State.OPEN);
+
+        // however, after some time (1 second according to the configuration)
+        // the circuit breaker will allow to make calls again
+        log.info("Waiting for the circuit breaker to switch to half-open state");
+        await().atMost(Duration.ofMillis(1200))
+                .until(() -> circuitBreaker.getState() == State.HALF_OPEN);
+
+        assertThatCode(() -> restTemplate.getForObject(
+                "http://localhost:{port}/sliced-endpoint?delay=400",
+                String.class, serverPort
+        )).doesNotThrowAnyException();
+
+        // but our circuit breaker will be in half-open state
+        // and it will allow only preconfigured number of calls "for free"
+        // the service already recovered, it can still block some calls
+
+        assertThatExceptionOfType(ResourceAccessException.class).isThrownBy(() -> {
+                    restTemplate.getForObject(
+                            "http://localhost:{port}/sliced-endpoint",
+                            String.class, serverPort
+                    );
+                }).havingRootCause().isInstanceOf(CallNotPermittedException.class)
+                .withMessageContaining("CircuitBreaker 'slow-service' is OPEN");
+
+        // now let's wait for the circuit breaker to switch to half-open state
+        // again and make the call
+        log.info("Waiting for the circuit breaker to switch to half-open state");
+
+        await().atMost(Duration.ofMillis(1200))
+                .until(() -> circuitBreaker.getState() == State.HALF_OPEN);
+
+        for (int i = 0; i < 4; i++) {
+            assertThatCode(() -> restTemplate.getForObject(
+                    "http://localhost:{port}/sliced-endpoint",
+                    String.class, serverPort
+            )).doesNotThrowAnyException();
+        }
+
+        // and once service got back to normal, circuit breaker will be closed
+        assertThat(circuitBreaker.getState()).isEqualTo(State.CLOSED);
+    }
+```
+
 ## Conclusion
 
 In this article, I've shown you to use `RestTemplate` and `RestClient` to make HTTP calls to external services.
@@ -1255,10 +1778,13 @@ I've also shown you how to test the code that uses `RestTemplate` and `RestClien
 in same way as you would make calls to external services.
 
 Core points of the article are:
-- if you are using `Spring`, you should use `RestTemplate` or `RestClient` to make HTTP calls to external services
-- you will get very simple and/or powerful apis out of the box without bringing 10 different libraries to your project
+- if you are using `Spring`, use `RestTemplate` or `RestClient` to make HTTP calls to external services as a facade for 
+http client and configure it via the extension points that `RestTemplateBuilder` provides
+- you will get very simple and/or powerful apis out of the box without bringing 10 different libraries to your project 
 - use built-in `MockRestServiceServer` and 'sliced' `@RestClientTest` to unit-test your code that makes HTTP calls, but
 keep in mind that it's a mock that does not actually make HTTP calls
 - configure underlying `ClientHttpRequestFactory` not to get into trouble with timeouts, connection pools, and other
 things that are important for production use
 - use `MockServer` to test/introspect e2e behavior of http calls in your application
+- use `ToxiProxy` to simulate tricky network conditions to test the configuration of your timeouts
+- use `CircuitBreaker` to protect your application from slow/constantly failing services
