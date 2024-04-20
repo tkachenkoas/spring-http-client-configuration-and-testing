@@ -1192,61 +1192,6 @@ to a fast server and 10 requests to a slow server, and these groups of requests 
     }
 ```
 
-Finally, here is an example of how to configure a minimalistic `RestTemplate` with a sane set of configurations
-for production use. This is a good starting point for your `RestTemplate` configuration, and you can adjust it
-to your needs. You can also use `RestTemplateBuilder` to build a `RestTemplate` with the same configuration.
-
-```
-    public RestTemplateBuilder builderWithSaneAmountOfConfigs(
-            String clientName,
-            MeterRegistry meterRegistry,
-            PropertyResolver propertyResolver
-    ) {
-        String propertyPrefix = "http.client." + clientName;
-        BiFunction<String, Integer, Integer> getIntProperty = (key, defaultValue) -> propertyResolver.getProperty(
-                propertyPrefix + "." + key, Integer.class, defaultValue
-        );
-        return new RestTemplateBuilder()
-                .requestFactory(() -> {
-                    PoolingHttpClientConnectionManager connectionManager = PoolingHttpClientConnectionManagerBuilder.create()
-                            .setMaxConnPerRoute(getIntProperty.apply("max-conn-per-route", 5))
-                            .setMaxConnTotal(getIntProperty.apply("max-conn-total", 10))
-                            .setPoolConcurrencyPolicy(LAX)
-                            .setDefaultConnectionConfig(
-                                    ConnectionConfig.custom()
-                                            .setConnectTimeout(Timeout.ofSeconds(
-                                                    getIntProperty.apply("connect-timeout-seconds", 3)
-                                            ))
-                                            .setSocketTimeout(Timeout.ofSeconds(
-                                                    getIntProperty.apply("socket-timeout-seconds", 60)
-                                            ))
-                                            .build()
-                            )
-                            .build();
-                    new PoolingHttpClientConnectionManagerMetricsBinder(connectionManager, clientName);
-                    return new HttpComponentsClientHttpRequestFactory(
-                            HttpClients.custom()
-                                    .setConnectionManager(connectionManager)
-                                    .setDefaultRequestConfig(
-                                            RequestConfig.custom()
-                                                    .setConnectionRequestTimeout(
-                                                            Timeout.ofSeconds(
-                                                                    getIntProperty.apply("connection-request-timeout-seconds", 3)
-                                                            )
-                                                    )
-                                                    .setResponseTimeout(
-                                                            Timeout.ofSeconds(
-                                                                    getIntProperty.apply("response-timeout-seconds", 60)
-                                                            )
-                                                    )
-                                                    .build()
-                                    )
-                                    .build()
-                    );
-                });
-    }
-```
-
 ## Deeper exploring of non-happy-path scenarios with timeouts
 
 In the previous examples, we've seen how to test the happy path of the code that makes HTTP calls. But what if 

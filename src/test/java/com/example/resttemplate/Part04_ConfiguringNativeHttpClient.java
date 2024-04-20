@@ -50,7 +50,7 @@ public class Part04_ConfiguringNativeHttpClient {
     }
 
     @Test
-    void settingTimeout_isAGoodIdea() {
+    void anExampleOfSettingReadTimeout_viaSimpleClientHttpRequestFactory() {
         // configure rest template to have a timeout
         RestTemplate restTemplate = new RestTemplate();
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
@@ -88,6 +88,60 @@ public class Part04_ConfiguringNativeHttpClient {
         assertThat(elapsed)
                 .isLessThan(2_300)
                 .isGreaterThan(2_000);
+    }
+
+    @Test
+    void anExampleOfConfiguringConnectionPool_andHowItCanAffectThroughPut() {
+        RestTemplate restTemplate = new RestTemplate();
+
+        // pooling connections saves time on handshaking and other https steps,
+        // and it saves resources on both caller and receiver side
+        PoolingHttpClientConnectionManager connectionManager = new PoolingHttpClientConnectionManager();
+        connectionManager.setMaxTotal(10);
+        // in simple words, "route" is the target domain (host:port)
+        connectionManager.setDefaultMaxPerRoute(10);
+
+        restTemplate.setRequestFactory(new HttpComponentsClientHttpRequestFactory(
+                HttpClients.custom()
+                        .setConnectionManager(connectionManager)
+                        .build()
+        ));
+
+        // remote server takes 2 seconds to respond
+        mockServer.when(
+                request()
+                        .withMethod("GET")
+                        .withPath("/some-endpoint")
+        ).respond(
+                response()
+                        .withStatusCode(200)
+                        .withDelay(TimeUnit.SECONDS, 2)
+        );
+
+        StopWatch stopWatch = new StopWatch();
+        stopWatch.start();
+
+        // now let's make 20 concurrent requests and wait for all of them to finish
+
+        CompletableFuture<Void> future = CompletableFuture.allOf(IntStream.range(0, 20)
+                .mapToObj(i -> CompletableFuture.runAsync(() -> {
+                    restTemplate.getForObject(
+                            "http://localhost:1100/some-endpoint",
+                            String.class
+                    );
+                }))
+                .toArray(CompletableFuture[]::new)
+        );
+        await().atMost(Duration.ofSeconds(1))
+                .until(() -> connectionManager.getTotalStats().getLeased() == 10);
+        future.join();
+
+        stopWatch.stop();
+        var elapsed = stopWatch.getTotalTimeMillis();
+        // even though we are making 20 requests concurrently,
+        // we have only 10 connections in the pool
+        // so the second half of the requests will have to wait
+        assertThat(elapsed).isGreaterThan(4_000).isLessThan(4_500);
     }
 
     @Test

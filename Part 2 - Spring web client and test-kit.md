@@ -1,8 +1,8 @@
 ## Spring's web client and test-kit
 
 ## Introduction
-This article is a part of a series of articles about the deep dive into 
-making http calls in Spring. Here are the other parts of the series:
+This article is a part of a series of articles about a deeper dive into 
+making http calls in Spring.
 
 - [Part 1 - Options and testing](...) 
 - [Part 2 - Spring web client and test-kit](...) (you're here)
