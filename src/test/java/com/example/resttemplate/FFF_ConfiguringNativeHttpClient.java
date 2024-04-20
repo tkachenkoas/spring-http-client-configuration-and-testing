@@ -1,6 +1,5 @@
 package com.example.resttemplate;
 
-import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.binder.httpcomponents.hc5.PoolingHttpClientConnectionManagerMetricsBinder;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import lombok.RequiredArgsConstructor;
@@ -18,8 +17,6 @@ import org.junit.jupiter.api.Test;
 import org.mockserver.client.MockServerClient;
 import org.mockserver.integration.ClientAndServer;
 import org.mockserver.junit.jupiter.MockServerSettings;
-import org.springframework.boot.web.client.RestTemplateBuilder;
-import org.springframework.core.env.PropertyResolver;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.util.StopWatch;
@@ -31,7 +28,6 @@ import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.BiFunction;
 import java.util.stream.IntStream;
 
 import static org.apache.hc.core5.pool.PoolConcurrencyPolicy.LAX;
@@ -178,10 +174,12 @@ public class FFF_ConfiguringNativeHttpClient {
                 .setMaxConnPerRoute(1)
                 .setDefaultConnectionConfig(
                         ConnectionConfig.custom()
+                                // JavaDoc
                                 // Determines the timeout until a new connection is fully established.
                                 // A timeout value of zero is interpreted as an infinite timeout.
                                 // Default: 3 minutes
                                 .setConnectTimeout(Timeout.of(2, TimeUnit.SECONDS))
+                                // JavaDoc
                                 // Determines the default socket timeout value for I/O operations.
                                 // Default: null (undefined)
                                 // Returns:
@@ -193,10 +191,12 @@ public class FFF_ConfiguringNativeHttpClient {
                 HttpClients.custom()
                         .setDefaultRequestConfig(
                                 RequestConfig.custom()
+                                        // JavaDoc
                                         // Returns the connection lease request timeout used when requesting a
                                         // connection from the connection manager.
                                         // Default: 3 minutes.
                                         .setConnectionRequestTimeout(Timeout.of(2, TimeUnit.SECONDS))
+                                        // JavaDoc
                                         // Determines the timeout until arrival of a response from the opposite endpoint.
                                         // A timeout value of zero is interpreted as an infinite timeout.
                                         // Please note that response timeout may be unsupported by HTTP transports with message multiplexing.
@@ -296,55 +296,6 @@ public class FFF_ConfiguringNativeHttpClient {
         // wait till slow server is done
         await().atMost(Duration.ofSeconds(10))
                 .until(() -> slowServerRequests.get() == 10);
-    }
-
-    public RestTemplateBuilder builderWithSaneAmountOfConfigs(
-            String clientName,
-            MeterRegistry meterRegistry,
-            PropertyResolver propertyResolver
-    ) {
-        String propertyPrefix = "http.client." + clientName;
-        BiFunction<String, Integer, Integer> getIntProperty = (key, defaultValue) -> propertyResolver.getProperty(
-                propertyPrefix + "." + key, Integer.class, defaultValue
-        );
-        return new RestTemplateBuilder()
-                .requestFactory(() -> {
-                    PoolingHttpClientConnectionManager connectionManager = PoolingHttpClientConnectionManagerBuilder.create()
-                            .setMaxConnPerRoute(getIntProperty.apply("max-conn-per-route", 5))
-                            .setMaxConnTotal(getIntProperty.apply("max-conn-total", 10))
-                            .setPoolConcurrencyPolicy(LAX)
-                            .setDefaultConnectionConfig(
-                                    ConnectionConfig.custom()
-                                            .setConnectTimeout(Timeout.ofSeconds(
-                                                    getIntProperty.apply("connect-timeout-seconds", 3)
-                                            ))
-                                            .setSocketTimeout(Timeout.ofSeconds(
-                                                    getIntProperty.apply("socket-timeout-seconds", 60)
-                                            ))
-                                            .build()
-                            )
-                            .build();
-                    new PoolingHttpClientConnectionManagerMetricsBinder(connectionManager, clientName);
-                    return new HttpComponentsClientHttpRequestFactory(
-                            HttpClients.custom()
-                                    .setConnectionManager(connectionManager)
-                                    .setDefaultRequestConfig(
-                                            RequestConfig.custom()
-                                                    .setConnectionRequestTimeout(
-                                                            Timeout.ofSeconds(
-                                                                    getIntProperty.apply("connection-request-timeout-seconds", 3)
-                                                            )
-                                                    )
-                                                    .setResponseTimeout(
-                                                            Timeout.ofSeconds(
-                                                                    getIntProperty.apply("response-timeout-seconds", 60)
-                                                            )
-                                                    )
-                                                    .build()
-                                    )
-                                    .build()
-                    );
-                });
     }
 
 }
