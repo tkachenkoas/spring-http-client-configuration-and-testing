@@ -21,7 +21,6 @@ import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuil
 import org.apache.hc.client5.http.protocol.HttpClientContext;
 import org.apache.hc.core5.http.ClassicHttpRequest;
 import org.apache.hc.core5.util.Timeout;
-import org.json.JSONException;
 import org.junit.jupiter.api.Test;
 import org.skyscreamer.jsonassert.JSONAssert;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -67,7 +66,7 @@ import static org.awaitility.Awaitility.await;
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT
 )
 @Slf4j
-public class GGG_WhenThingsGoNotAsPlanned {
+public class Part06_01_ExploringNonHappyPaths {
 
     /**
      * The excludes of auto-configurations are just to start the context,

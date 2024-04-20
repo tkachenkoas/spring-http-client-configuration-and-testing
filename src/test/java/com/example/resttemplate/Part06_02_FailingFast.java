@@ -21,7 +21,7 @@ import java.util.function.BiFunction;
 
 import static org.apache.hc.core5.pool.PoolConcurrencyPolicy.LAX;
 
-public class HHH_ConfiguringFailureProofRestTemplate {
+public class Part06_02_FailingFast {
 
     public static RestTemplateBuilder configurableFailProofRestTemplateBuilder(
             String clientName,

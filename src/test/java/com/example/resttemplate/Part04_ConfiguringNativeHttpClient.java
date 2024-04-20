@@ -40,7 +40,7 @@ import static org.mockserver.model.HttpResponse.response;
 @MockServerSettings(ports = 1100)
 @RequiredArgsConstructor
 @Slf4j
-public class FFF_ConfiguringNativeHttpClient {
+public class Part04_ConfiguringNativeHttpClient {
 
     private final MockServerClient mockServer;
 

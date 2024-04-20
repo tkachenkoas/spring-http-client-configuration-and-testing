@@ -14,7 +14,7 @@ understand and maintain by all the teams.
 In this article, I will cover high-level topics (but with few small dive-ins) and provide examples
 for various approaches to making HTTP calls in Java, and how to test them. 
 
-I will not be covering the topic of reactive/async clients, as it's a separate topic. Also, because most applications
+I will not be covering the topic of reactive/async clients, as it's a separate topic. Also, most applications
 still use synchronous clients (and other blocking processing). And as Java 21 is already out, might be that 
 virtual threads will be a game-changer for choosing sync vs async clients.
 

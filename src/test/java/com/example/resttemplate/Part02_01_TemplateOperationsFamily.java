@@ -24,9 +24,9 @@ import java.net.URI;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-class BBB_DeprecatedTemplateOperationsFamily extends TestWithMockServer {
+class Part02_01_TemplateOperationsFamily extends TestWithMockServer {
 
-    public BBB_DeprecatedTemplateOperationsFamily(MockServerClient mockServer) {
+    public Part02_01_TemplateOperationsFamily(MockServerClient mockServer) {
         super(mockServer);
     }
 
