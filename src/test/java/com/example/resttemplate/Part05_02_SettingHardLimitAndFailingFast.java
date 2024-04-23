@@ -1,6 +1,11 @@
 package com.example.resttemplate;
 
 
+import com.example.resttemplate.Part05_02_SettingHardLimitAndFailingFast.NetworkCasesEmulatingController.TheTestController;
+import com.example.resttemplate.Part05_02_SettingHardLimitAndFailingFast.NetworkCasesEmulatingController.TheTestController.DummyProduct;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import eu.rekawek.toxiproxy.Proxy;
 import eu.rekawek.toxiproxy.ToxiproxyClient;
 import eu.rekawek.toxiproxy.model.ToxicDirection;
@@ -8,18 +13,15 @@ import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker.State;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
-import jakarta.servlet.http.HttpServletResponse;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.hc.client5.http.classic.methods.HttpUriRequestBase;
 import org.apache.hc.client5.http.config.ConnectionConfig;
 import org.apache.hc.client5.http.config.RequestConfig;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
-import org.apache.hc.client5.http.protocol.HttpClientContext;
-import org.apache.hc.core5.http.ClassicHttpRequest;
 import org.apache.hc.core5.util.Timeout;
 import org.junit.jupiter.api.Test;
 import org.skyscreamer.jsonassert.JSONAssert;
@@ -32,6 +34,9 @@ import org.springframework.boot.autoconfigure.mongo.MongoAutoConfiguration;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.core.ParameterizedTypeReference;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.*;
 import org.springframework.util.ReflectionUtils;
 import org.springframework.util.StopWatch;
@@ -44,29 +49,37 @@ import org.springframework.web.client.RestTemplate;
 import org.testcontainers.Testcontainers;
 import org.testcontainers.containers.ToxiproxyContainer;
 import org.testcontainers.containers.output.Slf4jLogConsumer;
+import org.testcontainers.shaded.org.awaitility.core.ThrowingRunnable;
 
 import java.io.IOException;
-import java.io.PrintWriter;
 import java.lang.reflect.Field;
 import java.net.SocketException;
-import java.net.SocketTimeoutException;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Random;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 import static io.github.resilience4j.circuitbreaker.CircuitBreakerConfig.SlidingWindowType.COUNT_BASED;
 import static org.assertj.core.api.Assertions.*;
 import static org.awaitility.Awaitility.await;
+import static org.springframework.http.HttpMethod.GET;
 
 /**
  * Calls to our application need to come via http, so we need to start a server.
  */
 @SpringBootTest(
-        webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT
+        webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+        properties = {
+                "server.compression.enabled=true",
+                "server.compression.mime-types=application/json",
+                "server.compression.min-response-size=10240"
+        }
 )
 @Slf4j
-public class Part06_01_ExploringNonHappyPaths {
+public class Part05_02_SettingHardLimitAndFailingFast {
 
     /**
      * The excludes of auto-configurations are just to start the context,
@@ -87,93 +100,169 @@ public class Part06_01_ExploringNonHappyPaths {
         @RestController
         static class TheTestController {
 
-            List<String> slices = List.of(
-                    "[{",
-                    "  \"name\": \"First\"",
-                    "},",
-                    "{",
-                    "  \"name\": \"Second\"",
-                    "},",
-                    "{",
-                    "  \"name\": \"Third\"",
-                    "}]"
+            // we'll reuse some dummy data for the responses, and reusing it will ensure that data is compressable
+            static final List<String> NAMES_POOL = List.of("MacBook Pro", "iPhone 12", "iPad Pro", "Apple Watch", "AirPods");
+            static final List<String> DESCRIPTIONS_POOL = List.of(
+                    "The MacBook Pro is a line of Macintosh portable computers introduced in January 2006, by Apple Inc.",
+                    "The iPhone 12 and iPhone 12 Mini are smartphones designed, developed, and marketed by Apple Inc.",
+                    "The iPad Pro is a line of iPad tablet computers designed, developed, and marketed by Apple Inc.",
+                    "Apple Watch is a line of smartwatches produced by Apple Inc.",
+                    "AirPods are wireless Bluetooth earbuds created by Apple Inc."
             );
 
-            // delay and pause allow us to simulate slow and sliced response
-            @GetMapping("/sliced-endpoint")
-            public void returnSlicedResponseAccordingToRequest(
-                    @RequestParam(required = false, defaultValue = "0") Long delay,
-                    @RequestParam(required = false, defaultValue = "0") Long pause,
-                    HttpServletResponse response
-            ) throws Exception {
-                Thread.sleep(delay);
-                response.setContentType("application/json");
-                PrintWriter writer = response.getWriter();
-                for (String slice : slices) {
-                    Thread.sleep(pause);
-                    log.debug("Sending: {}", slice);
-                    writer.println(slice);
-                    writer.flush();
-                }
+            record DummyProduct(
+                    String id,
+                    String name,
+                    String description
+            ) {
             }
 
-            @GetMapping
-            public String returnGivenAmountOfData(
-                    @RequestParam Long kilobytes
+            // this is a "trick" not to compress the response
+            @GetMapping(value = "/responses", produces = "application/octet-stream")
+            public String getResponses(
+                    @RequestParam(required = false, defaultValue = "0") int count
+            ) throws JsonProcessingException {
+                List<DummyProduct> products = generateProducts(count);
+                return new ObjectMapper().writeValueAsString(products);
+            }
+
+            // application/json is compressible according to the configuration
+            @GetMapping(value = "/compressed-responses", produces = "application/json")
+            public List<DummyProduct> getCompressedResponses(
+                    @RequestParam(required = false, defaultValue = "0") int count
             ) {
-                return StringUtils.repeat("a", (int) (kilobytes * 1024));
+                return generateProducts(count);
+            }
+
+
+            // Such single product on average will be ~100 bytes
+            private List<DummyProduct> generateProducts(int count) {
+                List<DummyProduct> products = new ArrayList<>();
+                for (int i = 0; i < count; i++) {
+                    String id = RandomStringUtils.randomAlphanumeric(10);
+                    int productIndex = new Random().nextInt(NAMES_POOL.size());
+                    int descriptionIndex = new Random().nextInt(DESCRIPTIONS_POOL.size());
+                    products.add(
+                            new DummyProduct(
+                                    id,
+                                    NAMES_POOL.get(productIndex),
+                                    DESCRIPTIONS_POOL.get(descriptionIndex)
+                            )
+                    );
+                }
+                return products;
             }
 
         }
     }
 
+    /**
+     * we need tomcat to be already running to allow testcontainers to call the port
+     */
     @LocalServerPort
     int serverPort;
 
+    ToxiproxyContainer toxiproxy = new ToxiproxyContainer("ghcr.io/shopify/toxiproxy:2.5.0")
+            .withLogConsumer(new Slf4jLogConsumer(log));
+
+    record ToxiProxySetup(
+            String host,
+            int port,
+            eu.rekawek.toxiproxy.Proxy proxy
+    ) {
+
+    }
+
     /**
-     * see {@link org.apache.hc.client5.http.impl.classic.InternalExecRuntime#execute(String, ClassicHttpRequest, HttpClientContext)}
+     * See documentation of TestContainers for more details on how to configure
+     * networks in various cases.
      */
+    @SneakyThrows
+    private ToxiProxySetup setupToxiProxy() {
+        Testcontainers.exposeHostPorts(serverPort);
+        toxiproxy.start();
+
+        log.info("Server port: {}", serverPort);
+        ToxiproxyClient toxiproxyClient = new ToxiproxyClient(toxiproxy.getHost(), toxiproxy.getControlPort());
+        Proxy proxy = toxiproxyClient.createProxy(
+                "proxy-to-local-server", "0.0.0.0:8666",
+                "host.testcontainers.internal:" + serverPort
+        );
+        String proxyHost = toxiproxy.getHost();
+        int proxyPort = toxiproxy.getMappedPort(8666);
+        log.info("Toxiproxy port: {} & IP: {}", proxyPort, proxyHost);
+
+        return new ToxiProxySetup(proxyHost, proxyPort, proxy);
+    }
+
     @Test
-    void clientResponseTimeout_overridesConnPoolManagerSocketTimeout() throws Exception {
-        var socketLessThanResponse = buildRestTemplateWithLimits(
-                // socket timeout
-                Timeout.ofMilliseconds(200),
-                // response timeout
-                Timeout.ofMilliseconds(500)
-        );
+    void havingBandwidthLimit_compressionShouldHelp() throws Throwable {
+        ToxiProxySetup proxySetup = setupToxiProxy();
 
-        String response = socketLessThanResponse.getForObject(
-                "http://localhost:{port}/sliced-endpoint?delay=300", String.class, serverPort
-        );
-        JSONAssert.assertEquals(
-                "[{\"name\":\"First\"},{\"name\":\"Second\"},{\"name\":\"Third\"}]",
-                response, true
-        );
+        proxySetup.proxy().toxics().bandwidth("slow-down", ToxicDirection.DOWNSTREAM,
+                // rate in kilobytes per second
+                5);
 
-        assertThatThrownBy(() -> {
-            socketLessThanResponse.getForObject(
-                    "http://localhost:{port}/sliced-endpoint?delay=600", String.class, serverPort
+        // we don't care about actual limits now
+        RestTemplate restTemplate = buildRestTemplate();
+
+        // we'll make a call to the endpoint that returns ~12-15kb of data
+        Duration duration = timeIt(() -> {
+            ResponseEntity<String> response = restTemplate.getForEntity(
+                    "http://{ip}:{port}/responses?count=100",
+                    String.class, proxySetup.host(), proxySetup.port()
             );
-        }).isInstanceOf(ResourceAccessException.class)
-                .hasCauseInstanceOf(SocketTimeoutException.class)
-                .hasMessageContaining("Read timed out");
-
-
-        var responseLessThanSocket = buildRestTemplateWithLimits(
-                // socket timeout
-                Timeout.ofMilliseconds(500),
-                // response timeout
-                Timeout.ofMilliseconds(200)
+            HttpHeaders headers = response.getHeaders();
+            assertThat(headers.getContentType().toString())
+                    .contains("text/plain");
+            assertThat(headers.getContentLength())
+                    .isBetween(12 * 1024L, 15 * 1024L);
+            // parse body from JSON -> list will have 100 elements + some field values
+            List<DummyProduct> objects = new ObjectMapper().readValue(response.getBody(), new TypeReference<>() {
+            });
+            assertThat(objects).hasSize(100);
+            assertThat(objects.get(0).name()).isIn(TheTestController.NAMES_POOL);
+            assertThat(objects.get(0).description()).isIn(TheTestController.DESCRIPTIONS_POOL);
+        });
+        assertThat(duration).isBetween(
+                Duration.ofMillis(2500), Duration.ofMillis(3500)
         );
 
-        // even though we set socket timeout to 500ms, the actual limit comes from response timeout
-        assertThatThrownBy(() -> {
-            responseLessThanSocket.getForObject(
-                    "http://localhost:{port}/sliced-endpoint?pause=300", String.class, serverPort
+        // now let's see what happens when we call the endpoint eligible for compression
+        Duration compressedDuration = timeIt(() -> {
+            ResponseEntity<List<DummyProduct>> products = restTemplate.exchange(
+                    "http://{ip}:{port}/compressed-responses?count=100",
+                    GET, null,
+                    new ParameterizedTypeReference<>() {
+                    }, proxySetup.host(), proxySetup.port()
             );
-        }).isInstanceOf(ResourceAccessException.class)
-                .hasCauseInstanceOf(SocketTimeoutException.class)
-                .hasMessageContaining("Read timed out");
+            assertThat(products.getHeaders().getContentType())
+                    .hasToString("application/json");
+            assertThat(products.getBody()).hasSize(100);
+            assertThat(products.getBody().get(0).name()).isIn(TheTestController.NAMES_POOL);
+            assertThat(products.getBody().get(0).description()).isIn(TheTestController.DESCRIPTIONS_POOL);
+        });
+        assertThat(compressedDuration)
+                .isLessThan(Duration.ofSeconds(1));
+
+        // btw, new RestTemplate() will not support compression
+        RestTemplate restTemplateWithoutCompression = new RestTemplate();
+        Duration noCompressionSupportOnClient = timeIt(() -> {
+            ResponseEntity<List<DummyProduct>> products = restTemplateWithoutCompression.exchange(
+                    "http://{ip}:{port}/compressed-responses?count=100",
+                    GET, null,
+                    new ParameterizedTypeReference<>() {
+                    }, proxySetup.host(), proxySetup.port()
+            );
+            assertThat(products.getHeaders().getContentType())
+                    .hasToString("application/json");
+            assertThat(products.getBody()).hasSize(100);
+            assertThat(products.getBody().get(0).name()).isIn(TheTestController.NAMES_POOL);
+            assertThat(products.getBody().get(0).description()).isIn(TheTestController.DESCRIPTIONS_POOL);
+        });
+        assertThat(noCompressionSupportOnClient).isBetween(
+                Duration.ofMillis(2500), Duration.ofMillis(3500)
+        );
     }
 
     @Test
@@ -202,37 +291,6 @@ public class Part06_01_ExploringNonHappyPaths {
         assertThat(time).isBetween(7.5, 9.0);
     }
 
-    ToxiproxyContainer toxiproxy = new ToxiproxyContainer("ghcr.io/shopify/toxiproxy:2.5.0")
-            .withLogConsumer(new Slf4jLogConsumer(log));
-
-    record ToxiProxySetup(
-            String host,
-            int port,
-            Proxy proxy
-    ) {
-
-    }
-
-    /**
-     * See documentation of TestContainers for more details on how to configure
-     * networks in various cases.
-     */
-    private ToxiProxySetup setupToxiProxy() throws IOException {
-        Testcontainers.exposeHostPorts(serverPort);
-        toxiproxy.start();
-
-        log.info("Server port: {}", serverPort);
-        ToxiproxyClient toxiproxyClient = new ToxiproxyClient(toxiproxy.getHost(), toxiproxy.getControlPort());
-        Proxy proxy = toxiproxyClient.createProxy(
-                "proxy-to-local-server", "0.0.0.0:8666",
-                "host.testcontainers.internal:" + serverPort
-        );
-        String proxyHost = toxiproxy.getHost();
-        int proxyPort = toxiproxy.getMappedPort(8666);
-        log.info("Toxiproxy port: {} & IP: {}", proxyPort, proxyHost);
-
-        return new ToxiProxySetup(proxyHost, proxyPort, proxy);
-    }
 
     @Test
     void betterWayOfMockingSlicedBehaviorIsUsingToxiProxySlicer() throws Exception {
@@ -296,12 +354,6 @@ public class Part06_01_ExploringNonHappyPaths {
 
         HttpComponentsClientHttpRequestFactory apacheClientFactory = (HttpComponentsClientHttpRequestFactory)
                 restTemplateWithTimeout.getRequestFactory();
-
-        ClientHttpRequestFactory factoryWithHardTimeout = (uri, httpMethod) -> {
-            var request = apacheClientFactory.createRequest(uri, httpMethod);
-            return requestWithHardTimeout(request, 3, TimeUnit.SECONDS);
-        };
-        restTemplateWithTimeout.setRequestFactory(factoryWithHardTimeout);
 
         // now let's see what happens when we set inter-line delay to 900ms
         assertThatExceptionOfType(RestClientException.class).isThrownBy(() -> {
@@ -451,29 +503,53 @@ public class Part06_01_ExploringNonHappyPaths {
     private static RestTemplate buildRestTemplateWithLimits(
             Timeout socketTimeout, Timeout responseTimeout
     ) {
+        return buildRestTemplateWithLimits(
+                connConfig -> connConfig.setSocketTimeout(socketTimeout),
+                reqConfig -> reqConfig.setResponseTimeout(responseTimeout)
+        );
+
+    }
+
+    private static RestTemplate buildRestTemplate() {
+        return buildRestTemplateWithLimits(
+                __ -> {
+                }, __ -> {
+                }
+        );
+    }
+
+    private static RestTemplate buildRestTemplateWithLimits(
+            Consumer<ConnectionConfig.Builder> poolConfigCustomizer,
+            Consumer<RequestConfig.Builder> requestConfigCustomizer
+    ) {
+        ConnectionConfig.Builder connectionConfigBuilder = ConnectionConfig.custom()
+                .setConnectTimeout(Timeout.ofSeconds(1));
+        poolConfigCustomizer.accept(connectionConfigBuilder);
+
+        RequestConfig.Builder requestConfigBuilder = RequestConfig.custom()
+                .setConnectionRequestTimeout(Timeout.ofSeconds(1));
+        requestConfigCustomizer.accept(requestConfigBuilder);
+
         return new RestTemplateBuilder()
                 .requestFactory(() -> {
                     PoolingHttpClientConnectionManager connectionManager = PoolingHttpClientConnectionManagerBuilder.create()
-                            .setDefaultConnectionConfig(
-                                    ConnectionConfig.custom()
-                                            .setSocketTimeout(socketTimeout)
-                                            .setConnectTimeout(Timeout.ofSeconds(1))
-                                            .build()
-                            )
+                            .setDefaultConnectionConfig(connectionConfigBuilder.build())
                             .build();
                     return new HttpComponentsClientHttpRequestFactory(
                             HttpClients.custom()
                                     .setConnectionManager(connectionManager)
-                                    .setDefaultRequestConfig(
-                                            RequestConfig.custom()
-                                                    .setConnectionRequestTimeout(Timeout.ofSeconds(1))
-                                                    .setResponseTimeout(responseTimeout)
-                                                    .build()
-                                    )
+                                    .setDefaultRequestConfig(requestConfigBuilder.build())
                                     .build()
                     );
                 }).build();
     }
 
+    private Duration timeIt(ThrowingRunnable runnable) throws Throwable {
+        StopWatch stopWatch = new StopWatch();
+        stopWatch.start();
+        runnable.run();
+        stopWatch.stop();
+        return Duration.ofMillis(stopWatch.getTotalTimeMillis());
+    }
 
 }
