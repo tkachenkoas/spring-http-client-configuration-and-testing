@@ -8,8 +8,8 @@ making http calls in Spring.
 - [Part 2 - Spring web client and test-kit](...) (you're here)
 - [Part 3 - ClientHttpRequestFactory as abstraction over http layer](...)
 - [Part 4 - Configuring Apache Client via HttpComponentsClientHttpRequestFactory](...)
-- [Part 5 - Adding observability for web client](...)
-- [Part 6 - A deeper glance into non-happy-path scenarios](...)
+- [Part 5 - Setting hard limit on a request and failing fast](...)
+- [Part 6 - Adding observability for web client](...)
   All source code is available in the [GitHub repository](https://github.com/tkachenkoas/spring-web-client-in-depth).
 
 ## The `Template` and `Operations` pattern in Spring

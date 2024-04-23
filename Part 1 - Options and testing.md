@@ -11,8 +11,8 @@ Here are the links to the articles on medium:
 - [Part 2 - Spring web client and test-kit](...)
 - [Part 3 - ClientHttpRequestFactory as abstraction over http layer](...)
 - [Part 4 - Configuring Apache Client via HttpComponentsClientHttpRequestFactory](...)
-- [Part 5 - Adding observability for web client](...)
-- [Part 6 - A deeper glance into non-happy-path scenarios](...)
+- [Part 5 - Setting hard limit on a request and failing fast](...)
+- [Part 6 - Adding observability for web client](...)
 All source code is available in the [GitHub repository](https://github.com/tkachenkoas/spring-web-client-in-depth).
 
 Specifically, I am targeting the case of a big project with multiple teams

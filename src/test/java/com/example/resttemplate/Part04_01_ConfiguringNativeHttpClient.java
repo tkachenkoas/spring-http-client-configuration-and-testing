@@ -40,7 +40,7 @@ import static org.mockserver.model.HttpResponse.response;
 @MockServerSettings(ports = 1100)
 @RequiredArgsConstructor
 @Slf4j
-public class Part04_ConfiguringNativeHttpClient {
+public class Part04_01_ConfiguringNativeHttpClient {
 
     private final MockServerClient mockServer;
 
@@ -220,45 +220,19 @@ public class Part04_ConfiguringNativeHttpClient {
     }
 
     @Test
-    void requestDuration_shouldBeLimited() {
-        // configure rest template with a limit of connection request time
+    void limitedConnectionRequestTime_willThrowOnAllConnectionsBeingBlocked() {
+        // we'll configure a single connection pool
         RestTemplate restTemplate = new RestTemplate();
         var manager = PoolingHttpClientConnectionManagerBuilder.create()
                 .setMaxConnTotal(1)
-                .setMaxConnPerRoute(1)
-                .setDefaultConnectionConfig(
-                        ConnectionConfig.custom()
-                                // JavaDoc
-                                // Determines the timeout until a new connection is fully established.
-                                // A timeout value of zero is interpreted as an infinite timeout.
-                                // Default: 3 minutes
-                                .setConnectTimeout(Timeout.of(2, TimeUnit.SECONDS))
-                                // JavaDoc
-                                // Determines the default socket timeout value for I/O operations.
-                                // Default: null (undefined)
-                                // Returns:
-                                // the default socket timeout value for I/O operations.
-                                .setSocketTimeout(Timeout.of(6, TimeUnit.SECONDS))
-                                .build()
-                ).build();
+                .build();
         restTemplate.setRequestFactory(new HttpComponentsClientHttpRequestFactory(
                 HttpClients.custom()
                         .setDefaultRequestConfig(
                                 RequestConfig.custom()
-                                        // JavaDoc
-                                        // Returns the connection lease request timeout used when requesting a
-                                        // connection from the connection manager.
-                                        // Default: 3 minutes.
                                         .setConnectionRequestTimeout(Timeout.of(2, TimeUnit.SECONDS))
-                                        // JavaDoc
-                                        // Determines the timeout until arrival of a response from the opposite endpoint.
-                                        // A timeout value of zero is interpreted as an infinite timeout.
-                                        // Please note that response timeout may be unsupported by HTTP transports with message multiplexing.
-                                        // Default: null
-                                        .setResponseTimeout(Timeout.of(6, TimeUnit.SECONDS))
                                         .build()
-                        )
-                        .setConnectionManager(manager)
+                        ).setConnectionManager(manager)
                         .build()
         ));
 
@@ -266,8 +240,10 @@ public class Part04_ConfiguringNativeHttpClient {
         mockServer.when(request().withMethod("GET").withPath("/some-endpoint"))
                 .respond(response().withStatusCode(200).withDelay(TimeUnit.SECONDS, 5));
 
+        // this async operation will block the only connection in the pool
         CompletableFuture.runAsync(() -> restTemplate.getForObject("http://localhost:1100/some-endpoint", String.class));
 
+        // connection manager has api that can be used to monitor the pool
         await()
                 .atMost(Duration.ofSeconds(1))
                 .untilAsserted(() -> {
@@ -280,7 +256,8 @@ public class Part04_ConfiguringNativeHttpClient {
 
         assertThatThrownBy(() -> restTemplate.getForObject("http://localhost:1100/some-endpoint", String.class))
                 .isInstanceOf(ResourceAccessException.class)
-                .hasCauseInstanceOf(ConnectionRequestTimeoutException.class);
+                .hasCauseInstanceOf(ConnectionRequestTimeoutException.class)
+                .hasMessageContaining("Timeout deadline: 2000 MILLISECONDS, actual:");
     }
 
     @Test
@@ -351,5 +328,87 @@ public class Part04_ConfiguringNativeHttpClient {
         await().atMost(Duration.ofSeconds(10))
                 .until(() -> slowServerRequests.get() == 10);
     }
+
+    private RestTemplate buildWithTimeouts(
+            Timeout socketTimeout,
+            Timeout responseTimeout
+    ) {
+        RestTemplate restTemplate = new RestTemplate();
+
+        var manager = PoolingHttpClientConnectionManagerBuilder.create()
+                .setDefaultConnectionConfig(
+                        ConnectionConfig.custom()
+                                .setSocketTimeout(socketTimeout)
+                                .build()
+                )
+                .build();
+        restTemplate.setRequestFactory(new HttpComponentsClientHttpRequestFactory(
+                HttpClients.custom()
+                        .setDefaultRequestConfig(
+                                RequestConfig.custom()
+                                        .setResponseTimeout(responseTimeout)
+                                        .build()
+                        ).setConnectionManager(manager)
+                        .build()
+        ));
+        return restTemplate;
+    }
+
+    @Test
+    void requestTimeoutOfTheClient_willOverrideSocketTimeoutOfConnectionPool() {
+        // configure endpoint to respond in 2 seconds
+        mockServer.when(request().withMethod("GET").withPath("/some-endpoint"))
+                .respond(response()
+                        .withBody("hello")
+                        .withStatusCode(200).withDelay(TimeUnit.SECONDS, 2));
+
+        // set only socket timeout
+        RestTemplate onlySocketAndAbove = buildWithTimeouts(
+                Timeout.ofSeconds(5), null
+        );
+        assertThat(onlySocketAndAbove.getForObject("http://localhost:1100/some-endpoint", String.class))
+                .isEqualTo("hello");
+
+        // if socket timeout is less than server delay time, it will get an exception
+        RestTemplate onlySocketAndBelow = buildWithTimeouts(
+                Timeout.ofSeconds(1), null
+        );
+        assertThatThrownBy(() -> onlySocketAndBelow.getForObject("http://localhost:1100/some-endpoint", String.class))
+                .isInstanceOf(ResourceAccessException.class)
+                .hasCauseInstanceOf(SocketTimeoutException.class);
+
+        // set only response timeout
+        RestTemplate onlyResponseAndAbove = buildWithTimeouts(
+                null, Timeout.ofSeconds(5)
+        );
+        assertThat(onlyResponseAndAbove.getForObject("http://localhost:1100/some-endpoint", String.class))
+                .isEqualTo("hello");
+
+        // if response timeout is less than server delay time, it will get an exception
+        RestTemplate onlyResponseAndBelow = buildWithTimeouts(
+                null, Timeout.ofSeconds(1)
+        );
+        assertThatThrownBy(() -> onlyResponseAndBelow.getForObject("http://localhost:1100/some-endpoint", String.class))
+                .isInstanceOf(ResourceAccessException.class)
+                .hasCauseInstanceOf(SocketTimeoutException.class);
+
+        // set both socket and response timeout, but socket timeout is less than server delay time
+        RestTemplate bothAndSocketIsBelow = buildWithTimeouts(
+                Timeout.ofSeconds(1), Timeout.ofSeconds(5)
+        );
+        // response timeout wins
+        assertThat(bothAndSocketIsBelow.getForObject("http://localhost:1100/some-endpoint", String.class))
+                .isEqualTo("hello");
+
+        // not response timeout is less than server delay time
+        RestTemplate bothAndResponseIsBelow = buildWithTimeouts(
+                Timeout.ofSeconds(5), Timeout.ofSeconds(1)
+        );
+
+        assertThatThrownBy(() -> bothAndResponseIsBelow.getForObject("http://localhost:1100/some-endpoint", String.class))
+                .isInstanceOf(ResourceAccessException.class)
+                .hasCauseInstanceOf(SocketTimeoutException.class);
+    }
+
 
 }

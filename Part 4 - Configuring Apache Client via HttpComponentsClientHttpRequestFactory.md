@@ -8,8 +8,8 @@ making http calls in Spring.
 - [Part 2 - Spring web client and test-kit](...)
 - [Part 3 - ClientHttpRequestFactory as abstraction over http layer](...) 
 - [Part 4 - Configuring Apache Client via HttpComponentsClientHttpRequestFactory](...) (you're here)
-- [Part 5 - Adding observability for web client](...)
-- [Part 6 - A deeper glance into non-happy-path scenarios](...)
+- [Part 5 - Setting hard limit on a request and failing fast](...)
+- [Part 6 - Adding observability for web client](...)
   All source code is available in the [GitHub repository](https://github.com/tkachenkoas/spring-web-client-in-depth).
 
 ## Configurations that you should have in production
@@ -33,7 +33,7 @@ Base setup of mock server that we will use in the examples:
 @MockServerSettings(ports = 1100)
 @RequiredArgsConstructor
 @Slf4j
-public class Part04_ConfiguringNativeHttpClient {
+public class Part04_01_ConfiguringNativeHttpClient {
 
     private final MockServerClient mockServer;
 
@@ -109,18 +109,18 @@ Some non-standard implementation of this method ignores the specified timeout. T
 
 Internally, `HttpURLConnection` will most likely delegate the actual work to the underlying `java.sun.NetworkClient` 
 and `java.next.ServerSocket` low-level classes. What is important to understand is that `readTimeout` is NOT the request 
-execution timeout. In simple words, it's the time between two bytes of data being received. So, if you set `readTimeout` to 
+execution timeout. In simple words, it's the maximum allowed time between two bytes of data being received. So, if you set `readTimeout` to 
 20 seconds, you're giving the server 20 seconds to go to DB, fetch the data, and start sending it to you. Now, if some
-transport-level issues with bandwidth or chunking happen in the middle, you will wait upd to 20 seconds for each next byte of data,
+transport-level issues with bandwidth or chunking happen in the middle, the application will wait up to 20 seconds,
 and in theory, the request can last MUCH longer than 20 seconds.
 
-`MockServer` does not allow to test such cases in depth, but there are other tools like `ToxiProxy` that allow to simulate
+`MockServer` does not allow testing such cases in depth, but there are other tools like `ToxiProxy` that allow simulating
 such network issues - and we will cover them in the next article.
 
 ## Configuring Apache HttpClient via HttpComponentsClientHttpRequestFactory
 
-Apache HttpClient is a more advanced http client than the one provided by JDK. It has more features, more configuration
-options, and it's widely used in production. 
+Apache HttpClient is an advanced http client that has many features, more configuration
+options, and it's widely used in many production systems.
 
 We'll look into configuring two important aspects of Apache HttpClient:
 - connection pooling and reusing connections
@@ -187,90 +187,12 @@ increase the pool size.
     }
 ```
 
-Next configuration example is about setting timeouts for the request. There are multiple timeouts that you can set
-and they have different meanings. Unfortunately, not all of them can be properly tested with `MockServer`.
-The comments in the code are copy-pasted from corresponding javadocs. As you can see, default values are quite big,
-and you might want to set them to something more reasonable for your use cases.
-
-- `connectTimeout` - the time to establish the connection with the remote server
-- `socketTimeout` - the time to wait for the data to be received from the remote server. E.g. this is the interval
-  between two packets of data being received
-- `connectionRequestTimeout` - the time to wait for a connection from the connection manager/pool (if all connections
-  are currently being used, and the pool is exhausted, you'll get a timeout exception)
-- `responseTimeout` - the time to wait for the response from the remote server. E.g. this is the interval between the
-  client sending the request and the server reacting with anything ( headers, body)
-
-In the provided example, we're creating a "single-connection" pool and blocking the connection for 5 seconds with
-a slow response. We can also access the connection pool stats and verify that the connection is leased.
-
-```
-    @Test
-    void requestDuration_shouldBeLimited() {
-        // configure rest template with a limit of connection request time
-        RestTemplate restTemplate = new RestTemplate();
-        var manager = PoolingHttpClientConnectionManagerBuilder.create()
-                .setMaxConnTotal(1)
-                .setMaxConnPerRoute(1)
-                .setDefaultConnectionConfig(
-                        ConnectionConfig.custom()
-                                // Determines the timeout until a new connection is fully established.
-                                // A timeout value of zero is interpreted as an infinite timeout.
-                                // Default: 3 minutes
-                                .setConnectTimeout(Timeout.of(2, TimeUnit.SECONDS))
-                                // Determines the default socket timeout value for I/O operations.
-                                // Default: null (undefined)
-                                // Returns:
-                                // the default socket timeout value for I/O operations.
-                                .setSocketTimeout(Timeout.of(6, TimeUnit.SECONDS))
-                                .build()
-                ).build();
-        restTemplate.setRequestFactory(new HttpComponentsClientHttpRequestFactory(
-                HttpClients.custom()
-                        .setDefaultRequestConfig(
-                                RequestConfig.custom()
-                                        // Returns the connection lease request timeout used when requesting a
-                                        // connection from the connection manager.
-                                        // Default: 3 minutes.
-                                        .setConnectionRequestTimeout(Timeout.of(2, TimeUnit.SECONDS))
-                                        // Determines the timeout until arrival of a response from the opposite endpoint.
-                                        // A timeout value of zero is interpreted as an infinite timeout.
-                                        // Please note that response timeout may be unsupported by HTTP transports with message multiplexing.
-                                        // Default: null
-                                        .setResponseTimeout(Timeout.of(6, TimeUnit.SECONDS))
-                                        .build()
-                        )
-                        .setConnectionManager(manager)
-                        .build()
-        ));
-
-        // remote server is not responding in reasonable time
-        mockServer.when(request().withMethod("GET").withPath("/some-endpoint"))
-                .respond(response().withStatusCode(200).withDelay(TimeUnit.SECONDS, 5));
-
-        CompletableFuture.runAsync(() -> restTemplate.getForObject("http://localhost:1100/some-endpoint", String.class));
-
-        await()
-                .atMost(Duration.ofSeconds(1))
-                .untilAsserted(() -> {
-            PoolStats totalStats = manager.getTotalStats();
-            assertThat(totalStats.getPending()).isEqualTo(0);
-            assertThat(totalStats.getLeased()).isEqualTo(1);
-            assertThat(totalStats.getAvailable()).isEqualTo(0);
-            assertThat(totalStats.getMax()).isEqualTo(1);
-        });
-        
-        assertThatThrownBy(() -> restTemplate.getForObject("http://localhost:1100/some-endpoint", String.class))
-                .isInstanceOf(ResourceAccessException.class)
-                .hasCauseInstanceOf(ConnectionRequestTimeoutException.class);
-    }
-```
-
 One more example is about setting limits on the number of connections per route and choosing pool concurrency policy.
-If you are using same client to make requests to multiple host, you might want to limit the number of connections
-per route. This is especially important if you are making a lot of requests to a slow server, and you don't want
-to exhaust the connection pool.
+If you are using the same client to make requests to multiple hosts, you should limit the number of connections
+per route. This is especially important if you are making a lot of requests to a server that requires processing time, 
+and you don't want to exhaust the connection pool.
 
-Also you can choose between `LAX` and `STRICT` pool concurrency policy. Under the hood, when lease request is made,
+You can choose between `LAX` and `STRICT` pool concurrency policy. Under the hood, when lease request is made,
 the pool will do some locking and unlocking, and `LAX` policy will allow more concurrency. This is useful when you
 have a lot of concurrent and short requests. With `STRICT` policy, you might experience some starvation and spend more
 time on locking and unlocking that on actual request processing.
@@ -348,3 +270,170 @@ to a fast server and 10 requests to a slow server, and these groups of requests 
                 .until(() -> slowServerRequests.get() == 10);
     }
 ```
+
+The Next configuration example is about setting timeouts for the request. When building Apache http client with
+`PoolingHttpClientConnectionManager`, you can set multiple parameters that will affect overall duration. The configuration
+might be a bit misguiding, since you can configure `ConnectionConfig` and `RequestConfig` with similar parameters, and
+you won't have any exception with the feeling that you've set inconsistent values.
+
+The comments in the code are copy-pasted from corresponding javadocs. Pay attention that library defaults is usually not 
+the configuration that you want to have in production. Not all the parameters can be properly unit-tested with `MockServer`
+or any other tools (for instance, I don't know a wat to test `connectTimeout`). 
+
+- Parameters of `org.apache.hc.client5.http.config.ConnectionConfig`:
+  - `socketTimeout` - Determines the default socket timeout value for I/ O operations. Default: null (undefined)
+  - `connectTimeout` - Determines the timeout until a new connection is fully established. A timeout value of zero is 
+  interpreted as an infinite timeout. Default: 3 minutes. 
+  - `timeToLive` - Defines the total span of time connections can be kept alive or execute requests.
+    Default: null (undefined)
+- Parameters of `org.apache.hc.client5.http.config.RequestConfig`:
+  - `connectionRequestTimeout` - connection lease request timeout used when requesting a connection from the connection manager.
+  - `responseTimeout` - Determines the timeout until arrival of a response from the opposite endpoint.
+      A timeout value of zero is interpreted as an infinite timeout. Please note that response timeout may be unsupported 
+      by HTTP transports with message multiplexing.
+
+First, we'll illustrate the behavior of `connectionRequestTimeout`: if all connections are already in lease by pool
+manager, we should fail fast: the value of this parameter should not be too high.
+
+```
+    @Test
+    void limitedConnectionRequestTime_willThrowOnAllConnectionsBeingBlocked() {
+        // we'll configure a single connection pool
+        RestTemplate restTemplate = new RestTemplate();
+        var manager = PoolingHttpClientConnectionManagerBuilder.create()
+                .setMaxConnTotal(1)
+                .build();
+        restTemplate.setRequestFactory(new HttpComponentsClientHttpRequestFactory(
+                HttpClients.custom()
+                        .setDefaultRequestConfig(
+                                RequestConfig.custom()
+                                        .setConnectionRequestTimeout(Timeout.of(2, TimeUnit.SECONDS))
+                                        .build()
+                        ).setConnectionManager(manager)
+                        .build()
+        ));
+
+        // remote server is not responding in reasonable time
+        mockServer.when(request().withMethod("GET").withPath("/some-endpoint"))
+                .respond(response().withStatusCode(200).withDelay(TimeUnit.SECONDS, 5));
+
+        // this async operation will block the only connection in the pool
+        CompletableFuture.runAsync(() -> restTemplate.getForObject("http://localhost:1100/some-endpoint", String.class));
+
+        // connection manager has api that can be used to monitor the pool
+        await()
+                .atMost(Duration.ofSeconds(1))
+                .untilAsserted(() -> {
+                    PoolStats totalStats = manager.getTotalStats();
+                    assertThat(totalStats.getPending()).isEqualTo(0);
+                    assertThat(totalStats.getLeased()).isEqualTo(1);
+                    assertThat(totalStats.getAvailable()).isEqualTo(0);
+                    assertThat(totalStats.getMax()).isEqualTo(1);
+                });
+
+        assertThatThrownBy(() -> restTemplate.getForObject("http://localhost:1100/some-endpoint", String.class))
+                .isInstanceOf(ResourceAccessException.class)
+                .hasCauseInstanceOf(ConnectionRequestTimeoutException.class)
+                .hasMessageContaining("Timeout deadline: 2000 MILLISECONDS, actual:");
+    }
+```
+
+Now, let's take a look at the "conflicting" parameter of `socketTimeout` of connection pool and `responseTimeout` of
+the client's request config. The actual behavior is that the `responseTimeout` will be used and will override the
+`socketTimeout` of the connection pool. If you want to put a breakpoint, here is the place:
+`org.apache.hc.client5.http.impl.classic.InternalExecRuntime#execute(String, ClassicHttpRequest, HttpClientContext)`
+
+Here is detailed example that illustrates various cases when exception will be thrown, and when - it won't
+
+```
+    private RestTemplate buildWithTimeouts(
+            Timeout socketTimeout,
+            Timeout responseTimeout
+    ) {
+        RestTemplate restTemplate = new RestTemplate();
+
+        var manager = PoolingHttpClientConnectionManagerBuilder.create()
+                .setDefaultConnectionConfig(
+                        ConnectionConfig.custom()
+                                .setSocketTimeout(socketTimeout)
+                                .build()
+                )
+                .build();
+        restTemplate.setRequestFactory(new HttpComponentsClientHttpRequestFactory(
+                HttpClients.custom()
+                        .setDefaultRequestConfig(
+                                RequestConfig.custom()
+                                        .setResponseTimeout(responseTimeout)
+                                        .build()
+                        ).setConnectionManager(manager)
+                        .build()
+        ));
+        return restTemplate;
+    }
+
+    @Test
+    void requestTimeoutOfTheClient_willOverrideSocketTimeoutOfConnectionPool() {
+        // configure endpoint to respond in 2 seconds
+        mockServer.when(request().withMethod("GET").withPath("/some-endpoint"))
+                .respond(response()
+                        .withBody("hello")
+                        .withStatusCode(200).withDelay(TimeUnit.SECONDS, 2));
+
+        // set only socket timeout
+        RestTemplate onlySocketAndAbove = buildWithTimeouts(
+                Timeout.ofSeconds(5), null
+        );
+        assertThat(onlySocketAndAbove.getForObject("http://localhost:1100/some-endpoint", String.class))
+                .isEqualTo("hello");
+
+        // if socket timeout is less than server delay time, it will get an exception
+        RestTemplate onlySocketAndBelow = buildWithTimeouts(
+                Timeout.ofSeconds(1), null
+        );
+        assertThatThrownBy(() -> onlySocketAndBelow.getForObject("http://localhost:1100/some-endpoint", String.class))
+                .isInstanceOf(ResourceAccessException.class)
+                .hasCauseInstanceOf(SocketTimeoutException.class);
+
+        // set only response timeout
+        RestTemplate onlyResponseAndAbove = buildWithTimeouts(
+                null, Timeout.ofSeconds(5)
+        );
+        assertThat(onlyResponseAndAbove.getForObject("http://localhost:1100/some-endpoint", String.class))
+                .isEqualTo("hello");
+
+        // if response timeout is less than server delay time, it will get an exception
+        RestTemplate onlyResponseAndBelow = buildWithTimeouts(
+                null, Timeout.ofSeconds(1)
+        );
+        assertThatThrownBy(() -> onlyResponseAndBelow.getForObject("http://localhost:1100/some-endpoint", String.class))
+                .isInstanceOf(ResourceAccessException.class)
+                .hasCauseInstanceOf(SocketTimeoutException.class);
+
+        // set both socket and response timeout, but socket timeout is less than server delay time
+        RestTemplate bothAndSocketIsBelow = buildWithTimeouts(
+                Timeout.ofSeconds(1), Timeout.ofSeconds(5)
+        );
+        // response timeout wins
+        assertThat(bothAndSocketIsBelow.getForObject("http://localhost:1100/some-endpoint", String.class))
+                .isEqualTo("hello");
+
+        // not response timeout is less than server delay time
+        RestTemplate bothAndResponseIsBelow = buildWithTimeouts(
+                Timeout.ofSeconds(5), Timeout.ofSeconds(1)
+        );
+
+        assertThatThrownBy(() -> bothAndResponseIsBelow.getForObject("http://localhost:1100/some-endpoint", String.class))
+                .isInstanceOf(ResourceAccessException.class)
+                .hasCauseInstanceOf(SocketTimeoutException.class);
+    }
+```
+
+I'll continue with a more complex case of limiting full request execution time in the next article.
+
+## Conclusion
+
+In this article, we've seen how to use Apache HttpClient in `RestTemplate` via `HttpComponentsClientHttpRequestFactory`,
+how and why connection pooling is important, and how to set socket timeouts for the request and connection.
+
+My advice regarding these configs is to have tests for them independently of the business-logic tests to be able to
+verify expected behavior on simple examples and to make sure that you deliver the expected behavior in production.
