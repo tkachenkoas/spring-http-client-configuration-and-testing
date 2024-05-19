@@ -29,15 +29,14 @@ To imitate these cases, we'll do the following:
   will just behave normally (but will allow us to configure the amount of data it will return and whether it will be
   compressed).
 - send all the requests to the controller via [Toxiproxy](https://github.com/Shopify/toxiproxy) that will introduce
-  network misbehavior. And this is where
-  we'll introduce mutations to see how the configuration of http client can protect us.
+  network misbehavior. And this is where we'll introduce mutations to see how the configuration of http client can protect us.
 
 ## Application & test setup
 
 We have a simple controller that will return a list of products. The controller has two endpoints:
 
-- `/responses` that will return a list of products as a JSON string (but not as application/json). And
-  the only mime-type that supports compression according to config is `application/json`.
+- `/responses` that will return a list of products as a text/plain string that is a JSON (but not as application/json). 
+  And the only mime-type that supports compression according to `server.compression.mime-types` is `application/json`.
 - `/compressed-responses` that will return a list of products as a JSON string with `application/json` mime-type.
 
 ```
@@ -185,8 +184,31 @@ basic usage of it.
 This is what test helper methods look like:
 
 ```
+    /** Applies timeout of 1 second to the connection pool and 2 seconds to the request. */
+    private static RestTemplate buildRestTemplateWithLimits() {
+        return buildRestTemplateWithLimits(
+                Timeout.ofSeconds(1), Timeout.ofSeconds(2)
+        );
+    }
+
+    /** Will configure the connection pool's socket timeout and request's timeout. */
+    private static RestTemplate buildRestTemplateWithLimits(
+            Timeout socketTimeout, Timeout responseTimeout
+    ) {
+        return buildRestTemplateWithLimits(
+                connConfig -> connConfig.setSocketTimeout(socketTimeout),
+                reqConfig -> reqConfig.setResponseTimeout(responseTimeout)
+        );
+
+    }
+
+    /** Applies no customizations to the connection pool and request configuration. */
     private static RestTemplate buildRestTemplate() {
-        return buildRestTemplateWithLimits(__ -> {}, __ -> {});
+        return buildRestTemplateWithLimits(
+                __ -> {
+                }, __ -> {
+                }
+        );
     }
 
     private static RestTemplate buildRestTemplateWithLimits(
@@ -226,7 +248,8 @@ This is what test helper methods look like:
 
 Let's take a look at comparing response time of fetching 100 "products" from endpoint with limited bandwidth
 with compression and without compression. Pay attention to the third call that uses `RestTemplate` without 
-any configuration: this can make a huge difference in performance of fetching big chunks of data.
+any configuration: this can make a huge difference in performance of fetching big chunks of data. Whether compression
+will actually be applied or not depends both on the client AND server configuration.
 
 ```
     @Test
@@ -299,3 +322,111 @@ any configuration: this can make a huge difference in performance of fetching bi
         );
     }
 ```
+
+Now let's explore how timeout configurations can behave in real-world scenarios. In the example below, we set
+connection pool timeout to 1 second and request timeout to 2 seconds. The endpoint will return data with ~1 second
+delay between every 100 bytes of data. The overall time of the request will be way above the timeouts that we set.
+It is common to misunderstand the actual meaning of timeouts: `timeout` is the time that the client will wait for next 
+byte of data to arrive, not overall maximum execution time of the request. Thus, even if your client is configured 
+with certain timeouts, some real-world scenarios can still lead to long requests.
+
+```
+    @Test
+    void timeoutsOnRestTemplateMayNotBeEnough() throws Exception {
+        ToxiProxySetup setup = setupToxiProxy();
+
+        setup.proxy().toxics().slicer(
+                "slice", ToxicDirection.DOWNSTREAM,
+                // size in bytes of the slice
+                100,
+                // delay between slices in microseconds, e.g. 1 second
+                1_000_000
+        );
+
+        // socket timeout is 1 second, request timeout is 2 seconds
+        var restTemplateWithTimeout = buildRestTemplateWithLimits();
+
+        StopWatch stopWatch = new StopWatch();
+        stopWatch.start();
+        // the server will respond quickly, but the client will receive the response in slices
+        String rawResponse = restTemplateWithTimeout
+                .getForObject("http://{ip}:{port}/responses?count=4", String.class,
+                        setup.host(), setup.port()
+                );
+        // due to randomness of content, we can't predict the exact length
+        assertThat(rawResponse.length()).isBetween(400, 700);
+        stopWatch.stop();
+
+        // and overall time will be way about timeouts that we set
+        double time = stopWatch.getTotalTime(TimeUnit.SECONDS);
+        assertThat(time).isBetween(4.0, 8.0);
+    }
+```
+
+If we want to set real "hard" limit on the request, we can leverage `HttpUriRequestBase#cancel` method and schedule
+it to be called after certain amount of time. However, this raises an issue getting to the actual `HttpUriRequestBase`
+from `RestTemplate` high-level API. Below is an example of how to do it by using reflection and decorating the request
+from `HttpComponentsClientHttpRequestFactory`. Alternatively, there is a way to use `ClientHttpRequestInterceptor`
+of `RestTemplate` or `org.apache.hc.core5.http.HttpRequestInterceptor` to configure `HttpClientBuilder`  
+
+```
+    @Test
+    @SneakyThrows
+    void hardLimit_canBeSetByAbortingNativeApacheRequest() {
+        ToxiProxySetup setup = setupToxiProxy();
+
+        setup.proxy().toxics().slicer(
+                "slice", ToxicDirection.DOWNSTREAM,
+                // avg size + delay in microseconds
+                100, 1_000_000
+        );
+
+        var restTemplate = buildRestTemplateWithLimits();
+
+        HttpComponentsClientHttpRequestFactory factory = (HttpComponentsClientHttpRequestFactory)
+                restTemplate.getRequestFactory();
+
+        ClientHttpRequestFactory factoryWithHardTimeout = (uri, httpMethod) -> {
+            var request = factory.createRequest(uri, httpMethod);
+            return requestWithHardTimeout(request, 3, TimeUnit.SECONDS);
+        };
+        restTemplate.setRequestFactory(factoryWithHardTimeout);
+
+        // now let's see what happens when we fetch the data from "slow/sliced" endpoint
+        assertThatExceptionOfType(RestClientException.class)
+                .isThrownBy(() -> restTemplate.getForObject(
+                        "http://{ip}:{port}/responses?count=4", String.class,
+                        setup.host(), setup.port()
+                )).havingCause()
+                .isInstanceOf(SocketException.class)
+                .withMessage("Socket closed");
+    }
+
+    @SneakyThrows
+    private static ClientHttpRequest requestWithHardTimeout(
+            ClientHttpRequest request,
+            int timeout, TimeUnit timeoutTimeUnit
+    ) {
+        AbstractClientHttpRequest clientRequest = (AbstractClientHttpRequest) request;
+        // get field "httpRequest" from the request
+        Field reqField = ReflectionUtils.findField(request.getClass(), "httpRequest");
+        ReflectionUtils.makeAccessible(reqField);
+        HttpUriRequestBase apacheHttpRequest = (HttpUriRequestBase) reqField.get(clientRequest);
+        // schedule canceling the request after provided timeout
+        log.info("Scheduling hard cancel in {} {}", timeout, timeoutTimeUnit);
+        Executors.newSingleThreadScheduledExecutor().schedule(() -> {
+            log.info("Hard cancelling the request");
+            apacheHttpRequest.cancel();
+        }, timeout, timeoutTimeUnit);
+        return request;
+    }
+```
+
+However, I do not recommend aborting requests, because:
+- it's relying on too many internal details of the factory powering the `RestTemplate`. Thus, changes in the factory
+  implementation can break your code
+- it's not guaranteed that request object will be castable to `Cancellable` in all flows - thus logic will become more complex
+- concurrency and cancellation might mess up with some lifecycle of the request / connection - and you might end up
+  getting weird exceptions/warnings that are not reproducible in unit tests 
+- consistent cancellation of requests usually indicates that something goes wrong, and a better approach is to
+  fail-fast even before the request is sent

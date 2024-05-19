@@ -24,7 +24,6 @@ import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
 import org.apache.hc.core5.util.Timeout;
 import org.junit.jupiter.api.Test;
-import org.skyscreamer.jsonassert.JSONAssert;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.autoconfigure.data.jdbc.JdbcRepositoriesAutoConfiguration;
 import org.springframework.boot.autoconfigure.data.mongo.MongoDataAutoConfiguration;
@@ -267,99 +266,63 @@ public class Part05_02_SettingHardLimitAndFailingFast {
 
     @Test
     void timeoutsOnRestTemplateMayNotBeEnough() throws Exception {
-        var restTemplateWithTimeout = buildRestTemplateWithLimits();
-
-        // now let's see what happens when we set both
-        // initial delay and inter-line delay to 900ms
-        StopWatch stopWatch = new StopWatch();
-        stopWatch.start();
-        // making such request will succeed, and we'll get the response
-        var responseEntity = restTemplateWithTimeout.getForObject(
-                "http://localhost:{port}/sliced-endpoint?pause=900&delay=900", String.class,
-                serverPort
-        );
-
-        JSONAssert.assertEquals(
-                "[{\"name\":\"First\"},{\"name\":\"Second\"},{\"name\":\"Third\"}]",
-                responseEntity, true
-        );
-        stopWatch.stop();
-
-        // as long as we kept receiving data with intervals less than the timeout,
-        // overall time can be much longer than the timeout and then you expect
-        double time = stopWatch.getTotalTime(TimeUnit.SECONDS);
-        assertThat(time).isBetween(7.5, 9.0);
-    }
-
-
-    @Test
-    void betterWayOfMockingSlicedBehaviorIsUsingToxiProxySlicer() throws Exception {
         ToxiProxySetup setup = setupToxiProxy();
 
         setup.proxy().toxics().slicer(
                 "slice", ToxicDirection.DOWNSTREAM,
                 // size in bytes of the slice
-                10,
-                // delay between slices in microseconds
-                90000
+                100,
+                // delay between slices in microseconds, e.g. 1 second
+                1_000_000
         );
 
+        // socket timeout is 1 second, request timeout is 2 seconds
         var restTemplateWithTimeout = buildRestTemplateWithLimits();
 
         StopWatch stopWatch = new StopWatch();
         stopWatch.start();
-        // now server will respond quickly, but the client will receive the response
-        // in slices with 900ms delay between them
-        var responseEntity = restTemplateWithTimeout
-                .getForObject("http://{ip}:{port}/sliced-endpoint", String.class,
+        // the server will respond quickly, but the client will receive the response in slices
+        String rawResponse = restTemplateWithTimeout
+                .getForObject("http://{ip}:{port}/responses?count=4", String.class,
                         setup.host(), setup.port()
                 );
-        JSONAssert.assertEquals(
-                "[{\"name\":\"First\"},{\"name\":\"Second\"},{\"name\":\"Third\"}]",
-                responseEntity, true
-        );
+        // due to randomness of content, we can't predict the exact length
+        assertThat(rawResponse.length()).isBetween(400, 700);
         stopWatch.stop();
 
         // and overall time will be way about timeouts that we set
         double time = stopWatch.getTotalTime(TimeUnit.SECONDS);
-        assertThat(time).isBetween(4.0, 5.0);
+        assertThat(time).isBetween(4.0, 8.0);
     }
 
     @Test
-    void somethingCanHappenOnNetworkLevelThatWillCauseResponseToBeReturnedForever() throws Exception {
+    @SneakyThrows
+    void hardLimit_canBeSetByAbortingNativeApacheRequest() {
         ToxiProxySetup setup = setupToxiProxy();
 
-        setup.proxy().toxics().bandwidth("slow-down", ToxicDirection.DOWNSTREAM,
-                // rate in kilobytes per second
-                2);
-
-        var restTemplateWithTimeout = buildRestTemplateWithLimits();
-        // call the "fast" endpoint that returns 12kb of data
-        StopWatch stopWatch = new StopWatch();
-        stopWatch.start();
-        String response = restTemplateWithTimeout.getForObject(
-                "http://{ip}:{port}?kilobytes=12", String.class,
-                setup.host(), setup.port()
+        setup.proxy().toxics().slicer(
+                "slice", ToxicDirection.DOWNSTREAM,
+                // avg size + delay in microseconds
+                100, 1_000_000
         );
 
-        assertThat(response).hasSize(12 * 1024);
-        stopWatch.stop();
-        double time = stopWatch.getTotalTime(TimeUnit.SECONDS);
-        assertThat(time).isBetween(6.0, 7.0);
-    }
+        var restTemplate = buildRestTemplateWithLimits();
 
-    @Test
-    void settingHardLimit_viaAbortingNativeRequest() {
-        var restTemplateWithTimeout = buildRestTemplateWithLimits();
+        HttpComponentsClientHttpRequestFactory factory = (HttpComponentsClientHttpRequestFactory)
+                restTemplate.getRequestFactory();
 
-        HttpComponentsClientHttpRequestFactory apacheClientFactory = (HttpComponentsClientHttpRequestFactory)
-                restTemplateWithTimeout.getRequestFactory();
+        ClientHttpRequestFactory factoryWithHardTimeout = (uri, httpMethod) -> {
+            var request = factory.createRequest(uri, httpMethod);
+            return requestWithHardTimeout(request, 3, TimeUnit.SECONDS);
+        };
+        restTemplate.setRequestFactory(factoryWithHardTimeout);
 
-        // now let's see what happens when we set inter-line delay to 900ms
-        assertThatExceptionOfType(RestClientException.class).isThrownBy(() -> {
-                    restTemplateWithTimeout.getForObject("http://localhost:{port}/sliced-endpoint?delay=800",
-                            String.class, serverPort);
-                }).havingCause()
+        // now let's see what happens when we fetch the data from "slow/sliced" endpoint
+        assertThatExceptionOfType(RestClientException.class)
+                .isThrownBy(() -> restTemplate.getForObject(
+                        "http://{ip}:{port}/responses?count=4", String.class,
+                        setup.host(), setup.port()
+                )).havingCause()
                 .isInstanceOf(SocketException.class)
                 .withMessage("Socket closed");
     }
@@ -376,11 +339,10 @@ public class Part05_02_SettingHardLimitAndFailingFast {
         HttpUriRequestBase apacheHttpRequest = (HttpUriRequestBase) reqField.get(clientRequest);
         // schedule canceling the request after provided timeout
         log.info("Scheduling hard cancel in {} {}", timeout, timeoutTimeUnit);
-        Executors.newSingleThreadScheduledExecutor()
-                .schedule(() -> {
-                    log.info("Hard cancelling the request");
-                    apacheHttpRequest.abort();
-                }, timeout, timeoutTimeUnit);
+        Executors.newSingleThreadScheduledExecutor().schedule(() -> {
+            log.info("Hard cancelling the request");
+            apacheHttpRequest.cancel();
+        }, timeout, timeoutTimeUnit);
         return request;
     }
 
@@ -494,12 +456,18 @@ public class Part05_02_SettingHardLimitAndFailingFast {
         assertThat(circuitBreaker.getState()).isEqualTo(State.CLOSED);
     }
 
+    /**
+     * Applies timeout of 1 second to the connection pool and 2 seconds to the request.
+     */
     private static RestTemplate buildRestTemplateWithLimits() {
         return buildRestTemplateWithLimits(
                 Timeout.ofSeconds(1), Timeout.ofSeconds(2)
         );
     }
 
+    /**
+     * Will configure the connection pool's socket timeout and request's timeout.
+     */
     private static RestTemplate buildRestTemplateWithLimits(
             Timeout socketTimeout, Timeout responseTimeout
     ) {
@@ -510,6 +478,9 @@ public class Part05_02_SettingHardLimitAndFailingFast {
 
     }
 
+    /**
+     * Applies no customizations to the connection pool and request configuration.
+     */
     private static RestTemplate buildRestTemplate() {
         return buildRestTemplateWithLimits(
                 __ -> {
