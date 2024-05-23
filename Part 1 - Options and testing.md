@@ -315,7 +315,7 @@ Similar to Jersey, Retrofit has a type-safe HTTP client, which means that it cre
 As you can see, it's very convenient to use, but it also requires some additional setup
 (like defining the interface and the `Retrofit` object which acts as a factory for creating the actual HTTP client).
 
-## Summary and thoughts on choosing the library
+## Short conclusion of Part 1
 
 No matter which library you choose (except for direct usage of ```java.net.HttpURLConnection``` :) ), you can achieve the 
 expected behavior of your system. Some libraries have more complicated features and apis, some are more lightweight, but 

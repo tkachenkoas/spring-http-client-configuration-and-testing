@@ -432,7 +432,7 @@ check status code manually: exceptional cases will result in an exception being 
     }
 ```
 
-## Short summary of Part 2
+## Short conclusion of Part 2
 
 Spring ecosystem is very mature and provides lots of solutions for accessing external systems easier. 
 If you check the source of any Spring Project (like Spring Security), you will see that they themselves rely on 

@@ -221,7 +221,7 @@ public class Part03_02_ClientHttpRequestFactory {
 
 ```
 
-## Conclusion
+## Short conclusion of Part 3
 
 In this article, we've seen how `RestTemplate` uses `ClientHttpRequestFactory` to delegate the actual calls to a real
 HTTP client or some mock server from test-kit. Also, now you know how you can use `RestTemplate` or `RestClient` test

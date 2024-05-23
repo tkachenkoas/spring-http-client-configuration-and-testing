@@ -347,21 +347,33 @@ public class Part05_02_SettingHardLimitAndFailingFast {
     }
 
     @Test
-    void whenSomethingGoesWrongConsistently_weShouldShortCircuitCalls() {
-        // let's imagine that service consistently returns slow responses
-        // via our "native" sliced endpoint
+    void whenSomethingGoesWrongConsistently_weShouldShortCircuitCalls() throws Exception {
+        ToxiProxySetup setup = setupToxiProxy();
 
-        RestTemplate restTemplate = buildRestTemplateWithLimits();
-        restTemplate.getForObject(
-                "http://localhost:{port}/sliced-endpoint?delay=400",
-                String.class, serverPort
+        // let's imagine that service consistently returns slow responses
+        setup.proxy().toxics().slicer(
+                "slice", ToxicDirection.DOWNSTREAM,
+                // avg size + delay in microseconds
+                100, 500_000
         );
+
+        // this operation will succeed, but it will be slow
+        RestTemplate restTemplate = buildRestTemplateWithLimits();
+        Duration duration = timeIt(() -> restTemplate.getForObject(
+                "http://{host}:{port}/responses?count=1",
+                String.class, setup.host(), setup.port()
+        ));
+        assertThat(duration).isBetween(Duration.ofMillis(1000), Duration.ofMillis(2000));
 
         CircuitBreaker circuitBreaker = CircuitBreaker.of(
                 "slow-service", CircuitBreakerConfig.custom()
-                        .slowCallDurationThreshold(Duration.ofMillis(200))
+                        // 500ms is the threshold for slow calls
+                        .slowCallDurationThreshold(Duration.ofMillis(500))
+                        // and 90% of calls should be slow for the circuit breaker to open
                         .slowCallRateThreshold(90)
+                        // however, we'll accumulate statistics of at least 4 calls
                         .minimumNumberOfCalls(4)
+                        // e.g. only 10 calls will be taken into account for calculating statistics
                         .slidingWindowSize(10)
                         .slidingWindowType(COUNT_BASED)
                         .waitDurationInOpenState(Duration.ofSeconds(1))
@@ -374,8 +386,9 @@ public class Part05_02_SettingHardLimitAndFailingFast {
             log.info("Circuit breaker state transition: {}", event);
         });
 
+        // now we configure the rest template to use the circuit breaker via interceptor
         ClientHttpRequestInterceptor interceptor = (request, body, execution) -> {
-            log.info("Current state: {}", circuitBreaker.getState());
+            log.info("Current state before call: {}", circuitBreaker.getState());
             try {
                 return circuitBreaker.executeCheckedSupplier(() -> {
                     ClientHttpResponse executed = execution.execute(request, body);
@@ -392,12 +405,11 @@ public class Part05_02_SettingHardLimitAndFailingFast {
         restTemplate.getInterceptors().add(interceptor);
 
         // the behavior of rest template is now changed
-
         // first 3 calls will be slow, but they will succeed
         for (int i = 0; i < 4; i++) {
             assertThatCode(() -> restTemplate.getForObject(
-                    "http://localhost:{port}/sliced-endpoint?delay=400",
-                    String.class, serverPort
+                    "http://{host}:{port}/responses?count=1",
+                    String.class, setup.host(), setup.port()
             )).doesNotThrowAnyException();
         }
 
@@ -405,8 +417,8 @@ public class Part05_02_SettingHardLimitAndFailingFast {
         for (int i = 0; i < 4; i++) {
             assertThatExceptionOfType(ResourceAccessException.class).isThrownBy(() -> {
                         restTemplate.getForObject(
-                                "http://localhost:{port}/sliced-endpoint?delay=400",
-                                String.class, serverPort
+                                "http://{host}:{port}/responses?count=1",
+                                String.class, setup.host(), setup.port()
                         );
                     }).havingRootCause().isInstanceOf(CallNotPermittedException.class)
                     .withMessageContaining("CircuitBreaker 'slow-service' is OPEN");
@@ -421,19 +433,22 @@ public class Part05_02_SettingHardLimitAndFailingFast {
         await().atMost(Duration.ofMillis(1200))
                 .until(() -> circuitBreaker.getState() == State.HALF_OPEN);
 
+        // and the call will succeed
         assertThatCode(() -> restTemplate.getForObject(
-                "http://localhost:{port}/sliced-endpoint?delay=400",
-                String.class, serverPort
+                "http://{host}:{port}/responses?count=1",
+                String.class, setup.host(), setup.port()
         )).doesNotThrowAnyException();
 
-        // but our circuit breaker will be in half-open state
-        // and it will allow only preconfigured number of calls "for free"
-        // the service already recovered, it can still block some calls
+        // now we remove our "toxin" to emulate that service is back to normal
+        setup.proxy().toxics().get("slice").remove();
+
+        // even though the target recovered, some calls may still fail because
+        // previous calls in "suspicious" HALF_OPEN state were still slow
 
         assertThatExceptionOfType(ResourceAccessException.class).isThrownBy(() -> {
                     restTemplate.getForObject(
-                            "http://localhost:{port}/sliced-endpoint",
-                            String.class, serverPort
+                            "http://{host}:{port}/responses?count=1",
+                            String.class, setup.host(), setup.port()
                     );
                 }).havingRootCause().isInstanceOf(CallNotPermittedException.class)
                 .withMessageContaining("CircuitBreaker 'slow-service' is OPEN");
@@ -447,8 +462,8 @@ public class Part05_02_SettingHardLimitAndFailingFast {
 
         for (int i = 0; i < 4; i++) {
             assertThatCode(() -> restTemplate.getForObject(
-                    "http://localhost:{port}/sliced-endpoint",
-                    String.class, serverPort
+                    "http://{host}:{port}/responses?count=1",
+                    String.class, setup.host(), setup.port()
             )).doesNotThrowAnyException();
         }
 
@@ -515,7 +530,8 @@ public class Part05_02_SettingHardLimitAndFailingFast {
                 }).build();
     }
 
-    private Duration timeIt(ThrowingRunnable runnable) throws Throwable {
+    @SneakyThrows
+    private Duration timeIt(ThrowingRunnable runnable) {
         StopWatch stopWatch = new StopWatch();
         stopWatch.start();
         runnable.run();

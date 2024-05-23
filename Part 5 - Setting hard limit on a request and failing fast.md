@@ -323,12 +323,15 @@ will actually be applied or not depends both on the client AND server configurat
     }
 ```
 
-Now let's explore how timeout configurations can behave in real-world scenarios. In the example below, we set
-connection pool timeout to 1 second and request timeout to 2 seconds. The endpoint will return data with ~1 second
-delay between every 100 bytes of data. The overall time of the request will be way above the timeouts that we set.
-It is common to misunderstand the actual meaning of timeouts: `timeout` is the time that the client will wait for next 
-byte of data to arrive, not overall maximum execution time of the request. Thus, even if your client is configured 
-with certain timeouts, some real-world scenarios can still lead to long requests.
+## Exploring behavior of timeouts in real-world scenarios 
+
+Now let's see how timeout configurations can behave when application meets some disturbances in the network. 
+In the example below, we set connection pool timeout to 1 second and request timeout to 2 seconds. 
+The endpoint will return data with ~1 second delay between every 100 bytes of data. The overall time of the request 
+will be way above the timeouts that we set. It is common to misunderstand the actual meaning of timeouts: 
+`timeout` is the time that the client will wait for next byte of data to arrive, not overall maximum execution 
+time of the request. Thus, even if your client is configured with certain timeouts, some real-world scenarios 
+can still lead to long requests.
 
 ```
     @Test
@@ -363,11 +366,19 @@ with certain timeouts, some real-world scenarios can still lead to long requests
     }
 ```
 
-If we want to set real "hard" limit on the request, we can leverage `HttpUriRequestBase#cancel` method and schedule
-it to be called after certain amount of time. However, this raises an issue getting to the actual `HttpUriRequestBase`
-from `RestTemplate` high-level API. Below is an example of how to do it by using reflection and decorating the request
-from `HttpComponentsClientHttpRequestFactory`. Alternatively, there is a way to use `ClientHttpRequestInterceptor`
-of `RestTemplate` or `org.apache.hc.core5.http.HttpRequestInterceptor` to configure `HttpClientBuilder`  
+## Configuring hard total timeout on the request
+
+If we want to set real "hard" limit on the request execution, we can leverage apache client's `HttpUriRequestBase#cancel` method 
+and schedule it to be called after certain amount of time. However, this raises an issue reaching the actual 
+HttpUriRequestBase` from `RestTemplate` high-level API. Below is an example of how to do it by using reflection 
+and decorating the request from `HttpComponentsClientHttpRequestFactory`. Alternatively, there is a way to 
+use `ClientHttpRequestInterceptor` of `RestTemplate` or `org.apache.hc.core5.http.HttpRequestInterceptor` to 
+configure `HttpClientBuilder`.
+
+Note that aborting request is a complex mechanism that relies on setting a "canceled" flag in the request object, and
+actual cancellation will happen only after certain logic responsible for sending the request will check this flag. Think
+of it as something similar to "interrupting" a thread in Java: it's not guaranteed that the running task will stop,
+unless certain logic in the flow will check the "interrupted" flag and throw an exception.
 
 ```
     @Test
@@ -425,8 +436,172 @@ of `RestTemplate` or `org.apache.hc.core5.http.HttpRequestInterceptor` to config
 However, I do not recommend aborting requests, because:
 - it's relying on too many internal details of the factory powering the `RestTemplate`. Thus, changes in the factory
   implementation can break your code
-- it's not guaranteed that request object will be castable to `Cancellable` in all flows - thus logic will become more complex
+- it's not guaranteed that request object can be casted to `Cancellable` in all flows - thus logic will become more complex
 - concurrency and cancellation might mess up with some lifecycle of the request / connection - and you might end up
-  getting weird exceptions/warnings that are not reproducible in unit tests 
+  getting strange exceptions/warnings that are not reproducible in unit tests 
 - consistent cancellation of requests usually indicates that something goes wrong, and a better approach is to
   fail-fast even before the request is sent
+
+## Recommended way of dealing with requests that take too long
+
+If you know that certain requests can take much time, a good approach is usually to make them run in background so 
+that synchronous operations are not blocked. However, you still what to have a safety mechanism to protect
+your application from being overwhelmed by too many ultra-long requests that bypass your basic timeout mechanism.
+Setting hard limits is not a good idea also for the following reason:
+- suppose, you have configured general timeouts to be ~10 seconds
+- but you know that normally requests should not take more than 2-3 seconds, and maybe you want to also set a
+    hard limit of 15 seconds
+- however, some disruptions in the network started to cause all your requests to take 25 seconds
+- this means that now ALL your requests will be failing, and they will also block resources for whole
+  duration of 'sufficient' 15-second limit; and you probably don't want this behavior
+
+A classic approach is to use `Circuit breaker` pattern. The idea behind it is following:
+- when a certain number of requests fail or take too long, we need to stop calling the service - this is 
+called "opening the circuit"; instead, an exception will be thrown immediately - and we'll follow "failing fast" principle
+- however, after some time (or a manual action), calls should be allowed again to check if the service is back to normal
+
+Probably the best library to use for this purpose is `Resilience4j`. Please refer to the documentation for more details: 
+[R4J Circuit Breaker](https://resilience4j.readme.io/docs/circuitbreaker). By the way, it provides implementation of 
+many other resilience patterns like `RateLimiter`, `Retry`, `Bulkhead` and others.
+
+The lifecycle and configuration of the circuit breaker is very powerful (and complex), and it's hard to 
+provide a "one-size-fits-all" configuration. Thus, when decorating a certain operation with a circuit breaker, you 
+need to test its behavior very carefully and also to have good monitoring of the circuit breaker's state. The 
+example below is basic, yet it shows an example how `CircuitBreaker` in pair with `ClientHttpRequestInterceptor` 
+to protect your application from being disrupted by too many long or failing requests.
+
+```
+    @Test
+    void whenSomethingGoesWrongConsistently_weShouldShortCircuitCalls() throws Exception {
+        ToxiProxySetup setup = setupToxiProxy();
+
+        // let's imagine that service consistently returns slow responses
+        setup.proxy().toxics().slicer(
+                "slice", ToxicDirection.DOWNSTREAM,
+                // avg size + delay in microseconds
+                100, 500_000
+        );
+
+        // this operation will succeed, but it will be slow
+        RestTemplate restTemplate = buildRestTemplateWithLimits();
+        Duration duration = timeIt(() -> restTemplate.getForObject(
+                "http://{host}:{port}/responses?count=1",
+                String.class, setup.host(), setup.port()
+        ));
+        assertThat(duration).isBetween(Duration.ofMillis(1000), Duration.ofMillis(2000));
+
+        CircuitBreaker circuitBreaker = CircuitBreaker.of(
+                "slow-service", CircuitBreakerConfig.custom()
+                        // 500ms is the threshold for slow calls
+                        .slowCallDurationThreshold(Duration.ofMillis(500))
+                        // and 90% of calls should be slow for the circuit breaker to open
+                        .slowCallRateThreshold(90)
+                        // however, we'll accumulate statistics of at least 4 calls
+                        .minimumNumberOfCalls(4)
+                        // e.g. only 10 calls will be taken into account for calculating statistics
+                        .slidingWindowSize(10)
+                        .slidingWindowType(COUNT_BASED)
+                        .waitDurationInOpenState(Duration.ofSeconds(1))
+                        .enableAutomaticTransitionFromOpenToHalfOpen()
+                        .permittedNumberOfCallsInHalfOpenState(1)
+                        .maxWaitDurationInHalfOpenState(Duration.ofSeconds(2))
+                        .build()
+        );
+        circuitBreaker.getEventPublisher().onStateTransition(event -> {
+            log.info("Circuit breaker state transition: {}", event);
+        });
+
+        // now we configure the rest template to use the circuit breaker via interceptor
+        ClientHttpRequestInterceptor interceptor = (request, body, execution) -> {
+            log.info("Current state before call: {}", circuitBreaker.getState());
+            try {
+                return circuitBreaker.executeCheckedSupplier(() -> {
+                    ClientHttpResponse executed = execution.execute(request, body);
+                    log.info("Call was executed successfully");
+                    return executed;
+                });
+            } catch (Throwable e) {
+                // request interceptor's contract is to throw IOException
+                throw e instanceof IOException
+                        ? (IOException) e
+                        : new IOException(e);
+            }
+        };
+        restTemplate.getInterceptors().add(interceptor);
+
+        // the behavior of rest template is now changed
+        // first 3 calls will be slow, but they will succeed
+        for (int i = 0; i < 4; i++) {
+            assertThatCode(() -> restTemplate.getForObject(
+                    "http://{host}:{port}/responses?count=1",
+                    String.class, setup.host(), setup.port()
+            )).doesNotThrowAnyException();
+        }
+
+        // but if we make 4th, 5th, 6th and 7th call - they will fail
+        for (int i = 0; i < 4; i++) {
+            assertThatExceptionOfType(ResourceAccessException.class).isThrownBy(() -> {
+                        restTemplate.getForObject(
+                                "http://{host}:{port}/responses?count=1",
+                                String.class, setup.host(), setup.port()
+                        );
+                    }).havingRootCause().isInstanceOf(CallNotPermittedException.class)
+                    .withMessageContaining("CircuitBreaker 'slow-service' is OPEN");
+        }
+
+        // e.g. the circuit breaker is now in open state
+        assertThat(circuitBreaker.getState()).isEqualTo(State.OPEN);
+
+        // however, after some time (1 second according to the configuration)
+        // the circuit breaker will allow to make calls again
+        log.info("Waiting for the circuit breaker to switch to half-open state");
+        await().atMost(Duration.ofMillis(1200))
+                .until(() -> circuitBreaker.getState() == State.HALF_OPEN);
+
+        // and the call will succeed
+        assertThatCode(() -> restTemplate.getForObject(
+                "http://{host}:{port}/responses?count=1",
+                String.class, setup.host(), setup.port()
+        )).doesNotThrowAnyException();
+
+        // now we remove our "toxin" to emulate that service is back to normal
+        setup.proxy().toxics().get("slice").remove();
+
+        // even though the target recovered, some calls may still fail because
+        // previous calls in "suspicious" HALF_OPEN state were still slow
+
+        assertThatExceptionOfType(ResourceAccessException.class).isThrownBy(() -> {
+                    restTemplate.getForObject(
+                            "http://{host}:{port}/responses?count=1",
+                            String.class, setup.host(), setup.port()
+                    );
+                }).havingRootCause().isInstanceOf(CallNotPermittedException.class)
+                .withMessageContaining("CircuitBreaker 'slow-service' is OPEN");
+
+        // now let's wait for the circuit breaker to switch to half-open state
+        // again and make the call
+        log.info("Waiting for the circuit breaker to switch to half-open state");
+
+        await().atMost(Duration.ofMillis(1200))
+                .until(() -> circuitBreaker.getState() == State.HALF_OPEN);
+
+        for (int i = 0; i < 4; i++) {
+            assertThatCode(() -> restTemplate.getForObject(
+                    "http://{host}:{port}/responses?count=1",
+                    String.class, setup.host(), setup.port()
+            )).doesNotThrowAnyException();
+        }
+
+        // and once service got back to normal, circuit breaker will be closed
+        assertThat(circuitBreaker.getState()).isEqualTo(State.CLOSED);
+    }
+```
+
+# Short conclusion of Part 5
+
+This article illustrates how the real world can "by-pass" basic timeout configurations and how to 
+emulate such cases it "fair" way with `ToxiProxy`. It also shows how to set hard limits on the 
+request execution, and why a better approach is to use `CircuitBreaker`.
+However, the most practical recommendation in this article isto check if your applications are
+using `new RestTemplate()` to make calls in production. If you don't have good monitoring,
+you might be surprised how long some requests actually take, and how many resources they waster.

@@ -430,10 +430,16 @@ Here is detailed example that illustrates various cases when exception will be t
 
 I'll continue with a more complex case of limiting full request execution time in the next article.
 
-## Conclusion
+## Short conclusion of Part 4
 
 In this article, we've seen how to use Apache HttpClient in `RestTemplate` via `HttpComponentsClientHttpRequestFactory`,
 how and why connection pooling is important, and how to set socket timeouts for the request and connection.
 
 My advice regarding these configs is to have tests for them independently of the business-logic tests to be able to
 verify expected behavior on simple examples and to make sure that you deliver the expected behavior in production.
+
+In case you hesitate whether to use `MockServer` or `MockRestServiceServer`, I suggest the following rule of thumb:
+- if you're testing the logic/interaction of your component with a remote API via `RestTemplate`, 
+  use `MockRestServiceServer`. It's very flexible and even allows you to test the "real" URL.
+- if you're testing how your rest client makes http calls, use `MockServer`. In contrast to `MockRestServiceServer`,
+  it's not replacing a real layer of your application (e.g. http client), thus making tests more honest.
