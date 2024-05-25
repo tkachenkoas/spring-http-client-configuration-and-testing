@@ -18,9 +18,9 @@ import java.net.http.HttpResponse;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-public class AAA_DifferentWaysOfCallingApis extends TestWithMockServer {
+public class Part01_DifferentWaysOfCallingApis extends TestWithMockServer {
 
-    public AAA_DifferentWaysOfCallingApis(MockServerClient mockServer) {
+    public Part01_DifferentWaysOfCallingApis(MockServerClient mockServer) {
         super(mockServer);
     }
 

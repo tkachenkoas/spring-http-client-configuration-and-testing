@@ -11,12 +11,13 @@ import org.springframework.web.client.RestTemplate;
  * while also maintaining the flexibility to customize the requests and actions around
  * responses.
  */
-public class DDD_RequestFactory {
+public class Part03_01_ClientHttpRequestFactory {
 
     @Test
     void aGlimpseIntoMockRestServiceServer() {
         RestTemplate restTemplate = new RestTemplate();
 
+        // This logic is executed as part of @RestClientTest bootstrapping.
         MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
 
         Assertions.assertThat(restTemplate.getRequestFactory().getClass().getSimpleName())

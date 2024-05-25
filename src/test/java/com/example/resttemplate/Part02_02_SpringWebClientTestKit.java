@@ -25,7 +25,7 @@ import static org.springframework.test.web.client.response.MockRestResponseCreat
  * the beans that are needed to test the REST client.
  */
 @RestClientTest
-public class CCC_TestingWithRestClientTest {
+public class Part02_02_SpringWebClientTestKit {
 
     @SpringBootApplication
     static class SpringBootApplicationForTheCurrentTest {
