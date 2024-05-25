@@ -68,7 +68,7 @@ public class Part05_02_SettingHardLimitAndFailingFast {
                     DataSourceAutoConfiguration.class
             }
     )
-    static class NetworkCasesEmulatingController {
+    static class NetworkCasesEmulationApplication {
 
         @RestController
         static class TheTestController {

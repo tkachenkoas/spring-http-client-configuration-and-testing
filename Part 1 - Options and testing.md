@@ -15,13 +15,14 @@ Here are the links to the articles on medium:
 - [Part 6 - Adding observability for web client](...)
 All source code is available in the [GitHub repository](https://github.com/tkachenkoas/spring-web-client-in-depth).
 
-Specifically, I am targeting the case of a big project with multiple teams
-and multiple services. In such a case, it is important to have a consistent
-approach to common tasks like making HTTP calls so that the code is straightforward to
-understand and maintain by all the teams.
+Specifically, I am targeting the case of a big project with multiple teams and multiple services. In such a case, 
+it is important to have a consistent approach to common tasks like making HTTP calls so that the code is 
+straightforward to understand and maintain by all the teams.
 
-In this article, I will cover high-level topics (but with a few small dive-ins) and provide examples
-for various approaches to making HTTP calls in Java, and how to test them.
+In this article, I will cover high-level topics with occasional dive-ins and provide examples
+for various approaches to making HTTP calls in Java, and how to test them. If you are going to check out the 
+source code, please don't blame me for the fact that `.gradlew test` task fails: I did not invest time into making
+the project's build green (mostly because I reuse same ports). But every individual test will pass if you run it.
 
 I will not be covering the topic of reactive/async clients, as it's a separate topic. Also, most applications
 still use synchronous clients (and other blocking processing). And as Java 21 is already out, it might be that

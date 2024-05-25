@@ -1,8 +1,8 @@
 package com.example.resttemplate;
 
 
-import com.example.resttemplate.Part05_02_SettingHardLimitAndFailingFast.NetworkCasesEmulatingController.TheTestController;
-import com.example.resttemplate.Part05_02_SettingHardLimitAndFailingFast.NetworkCasesEmulatingController.TheTestController.DummyProduct;
+import com.example.resttemplate.Part05_02_SettingHardLimitAndFailingFast.NetworkCasesEmulationApplication.TheTestController;
+import com.example.resttemplate.Part05_02_SettingHardLimitAndFailingFast.NetworkCasesEmulationApplication.TheTestController.DummyProduct;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -80,6 +80,14 @@ import static org.springframework.http.HttpMethod.GET;
 @Slf4j
 public class Part05_02_SettingHardLimitAndFailingFast {
 
+    static final Class<?>[] excludes = {
+        MongoAutoConfiguration.class,
+                MongoDataAutoConfiguration.class,
+                RedisAutoConfiguration.class,
+                JdbcRepositoriesAutoConfiguration.class,
+                DataSourceAutoConfiguration.class
+    };
+
     /**
      * The excludes of auto-configurations are just to start the context,
      * since the repository has various spring-boot-starters for other examples.
@@ -94,7 +102,7 @@ public class Part05_02_SettingHardLimitAndFailingFast {
                     DataSourceAutoConfiguration.class
             }
     )
-    static class NetworkCasesEmulatingController {
+    static class NetworkCasesEmulationApplication {
 
         @RestController
         static class TheTestController {

@@ -1,42 +1,38 @@
-# Adding observability for web client
+package com.example.resttemplate;
 
-## Introduction
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.binder.httpcomponents.hc5.PoolingHttpClientConnectionManagerMetricsBinder;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import lombok.RequiredArgsConstructor;
+import lombok.SneakyThrows;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
+import org.junit.jupiter.api.Test;
+import org.mockserver.integration.ClientAndServer;
+import org.mockserver.junit.jupiter.MockServerSettings;
+import org.mockserver.model.Delay;
+import org.mockserver.model.MediaType;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.autoconfigure.data.jdbc.JdbcRepositoriesAutoConfiguration;
+import org.springframework.boot.autoconfigure.data.mongo.MongoDataAutoConfiguration;
+import org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration;
+import org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration;
+import org.springframework.boot.autoconfigure.mongo.MongoAutoConfiguration;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
+import org.springframework.web.client.RestTemplate;
 
-This article is a part of a series of articles about a deeper dive into
-making http calls in Spring.
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
-- [Part 1 - Options and testing](...)
-- [Part 2 - Spring web client and test-kit](...)
-- [Part 3 - ClientHttpRequestFactory as abstraction over http layer](...)
-- [Part 4 - Configuring Apache Client via HttpComponentsClientHttpRequestFactory](...)
-- [Part 5 - Setting hard limit on a request and failing fast](...)
-- [Part 6 - Adding observability for web client](...) (you're here)
-  All source code is available in the [GitHub repository](https://github.com/tkachenkoas/spring-web-client-in-depth).
-
-## Spring's default observability support
-
-Spring ecosystem provides a whole module dedicated to observability - `spring-boot-starter-actuator`. Under the hood,
-it uses the Micrometer library to collect metrics and also the integration with Prometheus and other popular monitoring
-systems. This article will not be about how to use Prometheus and Grafana, but rather how to add observability to
-your web client and also how not to accidentally hurt the performance of your application.
-
-The core component for Micrometer is `MeterRegistry`. If you search project and libraries in IDE for following
-`@ConditionalOnBean(MeterRegistry.class)`, you will find a lot of systems for which Spring Boot autoconfigures
-monitoring. For instance, `MongoMetricsAutoConfiguration` and `TomcatMetricsAutoConfiguration` will provide you with
-metrics for MongoDB and Tomcat, respectively.
-
-Also there is `HttpClientObservationsAutoConfiguration` which also includes `RestTemplateObservationConfiguration`
-that defines a bean of `ObservationRestTemplateCustomizer`. Long story short, this means that if you have
-`MeterRegistry` bean AND you use Spring's beans to build your`RestTemplate` via `RestTemplateBuilder`, then all
-the observability will be applied out of the box. This will not work is you instantiate `RestTemplate` manually.
-
-## Http client metrics collected out of the box 
-
-The setup for exploring rest template metrics is plain. We fully rely on Spring Boot autoconfiguration and
-will use the default `SimpleMeterRegistry` from spring-boot-starter-actuator. Also we will use the
-`RestTemplateBuilder` from context to build `RestTemplate` instances.
-
-```
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockserver.model.HttpRequest.request;
+import static org.mockserver.model.HttpResponse.response;
 
 @SpringBootTest
 @MockServerSettings(ports = 8090)
@@ -46,32 +42,32 @@ public class Part06_ObservabilityAndMonitoring {
 
     private final ClientAndServer mockServer;
 
-    @SpringBootApplication
+    /**
+     * The excludes of auto-configurations are just to start the context,
+     * since the repository has various spring-boot-starters for other examples.
+     * They are not related to the content of this class.
+     */
+    @SpringBootApplication(
+            exclude = {
+                    MongoAutoConfiguration.class, MongoDataAutoConfiguration.class,
+                    RedisAutoConfiguration.class, JdbcRepositoriesAutoConfiguration.class,
+                    DataSourceAutoConfiguration.class
+            }
+    )
     static class SimpleTestApplicationForRestTemplateMonitoring {
 
     }
 
     @Autowired
     RestTemplateBuilder restTemplateBuilder;
-    
+
     /**
-    * Unless prometheus / dropwizard / other monitoring system is configured,
-    * the default registry is SimpleMeterRegistry.
-    */
+     * Unless prometheus / dropwizard / other monitoring system is configured,
+     * the default registry is SimpleMeterRegistry.
+     */
     @Autowired
     SimpleMeterRegistry meterRegistry;
 
-...
-
-```
-
-In first example, we make a GET request to a mock server, and then we check the metrics collected by
-`SimpleMeterRegistry`. The metrics are collected by `http.client.requests` meters. The metrics will
-contain information about executed requests, and also about active requests. They will allow you to
-build graphs of total requests and average request time per uri/status. Unfortunately, richer statistical 
-information like distribution of request time is not available.   
-
-```
     @Test
     void restClient_builtViaContextBuilder_willHaveMonitoring() {
         RestTemplate restTemplate = restTemplateBuilder.build();
@@ -122,15 +118,7 @@ information like distribution of request time is not available.
                         metric.contains("active_tasks=1.0") &&
                         metric.contains("uri='/api/v1/employees/{id}'"));
     }
-```
 
-However, there is a catch. If you misuse `RestTemplat`'s api by invoking multiple different uri templated 
-due to String concatenation, then you will end up with a lot of metrics. This is because the `UriTemplate` is used 
-as a key to store the metrics. If your application makes lots of different requests with different URIs, then you might
-accidentally find that you have high CPU usage and response size of `/actuator/prometheus` to be megabytes 
-or even tens of megabytes.
-
-```
     @Test
     @SneakyThrows
     void misusingUriTemplate_canProduceTooManyMetrics() {
@@ -178,15 +166,7 @@ or even tens of megabytes.
                 .anyMatch(metric -> metric.contains("uri='/api/v1/employees/2'"))
                 .anyMatch(metric -> metric.contains("uri='/api/v1/employees/3'"));
     }
-```
 
-Lastly, if you configured `RestTemplate` with apache client powered by connection pool, then you can also monitor
-its metrics. The `PoolingHttpClientConnectionManager` has api to get information about the pool state. 
-And micrometer has a utility class `PoolingHttpClientConnectionManagerMetricsBinder` that acts as an adapter
-from `PoolingHttpClientConnectionManager` to `MeterRegistry`. Thus, you can get live information about the pool - 
-how many connections are leased, how many are available, etc.
-
-```
     @Test
     @SneakyThrows
     void connectionPool_canBeEasilyMonitored() {
@@ -242,26 +222,5 @@ how many connections are leased, how many are available, etc.
                         metric.contains("value=3.0"))
                 .anyMatch(metric -> metric.contains("httpcomponents.httpclient.pool.total.max(GAUGE)"));
     }
-```
 
-## Short conclusion of Part 6
-
-Like any other part of the Spring ecosystem, Spring's web client has built-in support for observability.
-You will get it out of the box if you use  `@Autowired RestTemplateBuilder rtb` to build `RestTemplate` instances.
-If you have prometheus or another monitoring system configured,
-check, how many metrics are collected from your web client,
-and if needed, disable it.
-Remember also to monitor the connection pool and adjust its size according to your needs.
-
-# General conclusion for the series of articles
-
-These articles can't be considered as a complete guide to Spring's web client or to making http calls in general. 
-Nor it can replace you the effort of reading the official documentation and the source code of the libraries.
-
-My goal was to share my personal experience and to show you some of the pitfalls that you might encounter. 
-One of the core focuses was not only to mention a certain feature/configuration options,
-but also to create a reproducible example that allows to reproduce the use case and to play with it.
-
-I hope that you found these articles useful and that you will be able to apply the knowledge in your projects. If you
-discovered any issues in the provided examples, feel free to create an issue in the comments or in 
-[GitHub repository](https://github.com/tkachenkoas/spring-web-client-in-depth)
+}
