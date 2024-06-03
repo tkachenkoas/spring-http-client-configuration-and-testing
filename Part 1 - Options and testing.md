@@ -120,10 +120,15 @@ public class TestWithMockServer {
 
     protected record SampleResponseModel(String name, int age) {
     }
+    
+    protected record ErrorResponseModel(String error) {
+    }
 
     @BeforeEach
-    void resetAndConfigureSimpleCall() {
+    void reset() {
         mockServer.reset();
+        // expect GET /some-endpoint
+        // and respond with 200 OK + response body
         mockServer.when(
                 org.mockserver.model.HttpRequest.request()
                         .withMethod("GET")
@@ -134,8 +139,18 @@ public class TestWithMockServer {
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"name\":\"John\",\"age\":25}")
         );
+        // + configure non-ok responses
+        mockServer.when(
+                org.mockserver.model.HttpRequest.request()
+                        .withMethod("GET")
+                        .withPath("/bad-req-endpoint")
+        ).respond(
+                org.mockserver.model.HttpResponse.response()
+                        .withStatusCode(400)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"error\":\"Bad request\"}")
+        );
     }
-
 }
 ```
 
@@ -195,10 +210,21 @@ Not that we have to manually parse the response body into an object by using any
                 .readValue(response.body(), SampleResponseModel.class);
 
         assertThat(asObject).isEqualTo(new SampleResponseModel("John", 25));
+
+        // now making the call to the bad-req endpoint
+        HttpRequest badRequest = java.net.http.HttpRequest.newBuilder()
+                .uri(java.net.URI.create("http://localhost:1090/bad-req-endpoint"))
+                .header("Accept", "application/json")
+                .build();
+
+        HttpResponse<String> badResponse = client.send(badRequest, java.net.http.HttpResponse.BodyHandlers.ofString());
+        assertThat(badResponse.statusCode()).isEqualTo(400);
+        assertThat(badResponse.body()).isEqualTo("{\"error\":\"Bad request\"}");
     }
 ```
 
 In comparison with `java.net.HttpURLConnection`, the `java.net.http.HttpClient` requires less boilerplate code.
+Pay attention that you need to manually parse the response body into an object and to handle non-2xx responses.
 
 ### Apache HttpClient
 
@@ -206,7 +232,7 @@ In comparison with `java.net.HttpURLConnection`, the `java.net.http.HttpClient` 
     @Test
     void withApacheHttpClient() throws Exception {
         try (CloseableHttpClient client = HttpClientBuilder.create().build()) {
-            HttpGet request = new org.apache.hc.client5.http.classic.methods.HttpGet("http://localhost:1090/some-endpoint");
+            org.apache.hc.client5.http.classic.methods.HttpGet request = new org.apache.hc.client5.http.classic.methods.HttpGet("http://localhost:1090/some-endpoint");
             request.addHeader("Accept", "application/json");
             CloseableHttpResponse response = client.execute(request);
             assertThat(response.getCode()).isEqualTo(200);
@@ -215,13 +241,20 @@ In comparison with `java.net.HttpURLConnection`, the `java.net.http.HttpClient` 
                     .readValue(response.getEntity().getContent(), SampleResponseModel.class);
 
             assertThat(asObject).isEqualTo(new SampleResponseModel("John", 25));
+
+            // now making the call to the bad-req endpoint
+            org.apache.hc.client5.http.classic.methods.HttpGet badRequest = new org.apache.hc.client5.http.classic.methods.HttpGet("http://localhost:1090/bad-req-endpoint");
+            CloseableHttpResponse badResponse = client.execute(badRequest);
+            assertThat(badResponse.getCode()).isEqualTo(400);
+            assertThat(new com.fasterxml.jackson.databind.ObjectMapper()
+                    .readTree(badResponse.getEntity().getContent()).get("error").asText()).isEqualTo("Bad response for bad request");
         }
     }
 ```
 
-I will not dive deeper into the Apache HttpClient, as it's a big library with a lot of features, but
-you can see that it adds more abstractions over the HTTP protocol (
-like `CloseableHttpClient`, `HttpGet`, `CloseableHttpResponse`).
+Here I will not dive into the Apache HttpClient, as it's a big library with a lot of features, but
+you can see that it adds more abstractions over the HTTP protocol (like `CloseableHttpClient`, `HttpGet`, 
+`CloseableHttpResponse`).
 
 ### OkHttp
 
@@ -257,13 +290,27 @@ code.
                     .get(SampleResponseModel.class);
 
             assertThat(response).isEqualTo(new SampleResponseModel("John", 25));
+
+            // making the call to the bad-req endpoint will throw  jakarta.ws.rs.BadRequestException
+            Assertions.assertThatExceptionOfType(
+                            jakarta.ws.rs.BadRequestException.class
+                    ).isThrownBy(
+                            () -> client.target("http://localhost:1090/bad-req-endpoint")
+                                    .request()
+                                    .get(ErrorResponseModel.class)
+                    ).withMessage("HTTP 400 Bad Request")
+                    .extracting(e -> e.getResponse().readEntity(ErrorResponseModel.class))
+                    .isEqualTo(new ErrorResponseModel("Bad response for bad request"));
         }
     }
 ```
 
 Jersey is a JAX-RS implementation, so it's very convenient to use if you are already using JAX-RS for web layer 
 (and not using Spring-Web). Also, unlike the previous examples, it has a built-in support for parsing the response body 
-into an object, which is very convenient.
+into an object, which is very convenient. Also unlike most of the previous examples, it throws an exception for non-2xx
+responses, and this provides some consistency when writing application code. E.g., you write your code to expect a
+successful outcome, and if something goes not as expected, you will get an exception that you can handle (and not 
+a silent swallowed failure).
 
 Also, it's worth mentioning that Jersey has proxy-extension ```implementation 'org.glassfish.jersey.ext:jersey-proxy-client'```
 for creating a proxy for an interface that represents the API. Here is an example of how to use it:
@@ -278,6 +325,10 @@ for creating a proxy for an interface that represents the API. Here is an exampl
             @GET
             @Path("/some-endpoint")
             SampleResponseModel getOurDomainModel();
+
+            @GET
+            @Path("/bad-req-endpoint")
+            SampleResponseModel getBadResponse();
         }
 
         var target = jakarta.ws.rs.client.ClientBuilder.newClient().target("http://localhost:1090");
@@ -287,6 +338,15 @@ for creating a proxy for an interface that represents the API. Here is an exampl
         SampleResponseModel response = ourServiceProxy.getOurDomainModel();
 
         assertThat(response).isEqualTo(new SampleResponseModel("John", 25));
+
+        // making the call to the bad-req endpoint will throw  jakarta.ws.rs.BadRequestException
+        Assertions.assertThatExceptionOfType(
+                        jakarta.ws.rs.BadRequestException.class
+                ).isThrownBy(
+                        () -> ourServiceProxy.getBadResponse()
+                ).withMessage("HTTP 400 Bad Request")
+                .extracting(e -> e.getResponse().readEntity(ErrorResponseModel.class))
+                .isEqualTo(new ErrorResponseModel("Bad response for bad request"));
     }
 ```
 
@@ -298,8 +358,11 @@ for creating a proxy for an interface that represents the API. Here is an exampl
         interface RemoteRetrofitService {
             @retrofit2.http.GET("/some-endpoint")
             retrofit2.Call<SampleResponseModel> getOurDomainModel();
+
+            @retrofit2.http.GET("/bad-req-endpoint")
+            retrofit2.Call<SampleResponseModel> getBadResponse();
         }
-        
+
         retrofit2.Retrofit retrofit = new retrofit2.Retrofit.Builder()
                 .baseUrl("http://localhost:1090")
                 .addConverterFactory(GsonConverterFactory.create())
@@ -309,6 +372,11 @@ for creating a proxy for an interface that represents the API. Here is an exampl
         retrofit2.Response<SampleResponseModel> response = call.execute();
         assertThat(response.code()).isEqualTo(200);
         assertThat(response.body()).isEqualTo(new SampleResponseModel("John", 25));
+
+        // non-ok responses still need to be handled
+        retrofit2.Call<SampleResponseModel> badCall = service.getBadResponse();
+        retrofit2.Response<SampleResponseModel> badResponse = badCall.execute();
+        assertThat(badResponse.code()).isEqualTo(400);
     }
 ```
 
@@ -330,4 +398,4 @@ However, there are some things to consider when choosing the solution:
 - whether the library is actively maintained (all the mentioned libraries are, but it's not always the case)
 - whether it supports serialization/deserialization of the request/response bodies as part of the api
 - whether it has additional test-kit features to make testing easier
-- whether it supports interface/"typed" proxy apis
+- whether it supports interface/"typed" proxy apis 

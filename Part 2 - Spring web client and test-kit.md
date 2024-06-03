@@ -70,7 +70,7 @@ Here is an example of just making a simple GET request with `RestTemplate`:
 
 As you can see, `RestTemplate` is very convenient to use, and it also has built-in support for parsing the response body
 into an object.  In general, you SHOULD NOT just use `new RestTemplate()` in production (and to make additional configs), 
-and it will be covered later in the articles.
+and it will be covered later in part 5 of this series.
 
 Here is a more complex example of setting headers/cookies. In this case, we have to use `RequestEntity` to set the
 headers,

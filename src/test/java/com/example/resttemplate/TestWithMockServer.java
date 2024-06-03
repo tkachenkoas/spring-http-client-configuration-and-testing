@@ -14,6 +14,9 @@ public class TestWithMockServer {
     protected record SampleResponseModel(String name, int age) {
     }
 
+    protected record ErrorResponseModel(String error) {
+    }
+
     @BeforeEach
     void reset() {
         mockServer.reset();
@@ -28,6 +31,17 @@ public class TestWithMockServer {
                         .withStatusCode(200)
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"name\":\"John\",\"age\":25}")
+        );
+        // + configure non-ok responses
+        mockServer.when(
+                org.mockserver.model.HttpRequest.request()
+                        .withMethod("GET")
+                        .withPath("/bad-req-endpoint")
+        ).respond(
+                org.mockserver.model.HttpResponse.response()
+                        .withStatusCode(400)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"error\":\"Bad response for bad request\"}")
         );
     }
 

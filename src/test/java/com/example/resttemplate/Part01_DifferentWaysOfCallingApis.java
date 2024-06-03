@@ -8,12 +8,14 @@ import okhttp3.OkHttpClient;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpResponse;
 import org.apache.hc.client5.http.impl.classic.HttpClientBuilder;
+import org.assertj.core.api.Assertions;
 import org.glassfish.jersey.client.proxy.WebResourceFactory;
 import org.junit.jupiter.api.Test;
 import org.mockserver.client.MockServerClient;
 import retrofit2.converter.gson.GsonConverterFactory;
 
 import java.net.URL;
+import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -59,6 +61,16 @@ public class Part01_DifferentWaysOfCallingApis extends TestWithMockServer {
                 .readValue(response.body(), SampleResponseModel.class);
 
         assertThat(asObject).isEqualTo(new SampleResponseModel("John", 25));
+
+        // now making the call to the bad-req endpoint
+        HttpRequest badRequest = java.net.http.HttpRequest.newBuilder()
+                .uri(java.net.URI.create("http://localhost:1090/bad-req-endpoint"))
+                .header("Accept", "application/json")
+                .build();
+
+        HttpResponse<String> badResponse = client.send(badRequest, java.net.http.HttpResponse.BodyHandlers.ofString());
+        assertThat(badResponse.statusCode()).isEqualTo(400);
+        assertThat(badResponse.body()).isEqualTo("{\"error\":\"Bad request\"}");
     }
 
     @Test
@@ -73,6 +85,13 @@ public class Part01_DifferentWaysOfCallingApis extends TestWithMockServer {
                     .readValue(response.getEntity().getContent(), SampleResponseModel.class);
 
             assertThat(asObject).isEqualTo(new SampleResponseModel("John", 25));
+
+            // now making the call to the bad-req endpoint
+            org.apache.hc.client5.http.classic.methods.HttpGet badRequest = new org.apache.hc.client5.http.classic.methods.HttpGet("http://localhost:1090/bad-req-endpoint");
+            CloseableHttpResponse badResponse = client.execute(badRequest);
+            assertThat(badResponse.getCode()).isEqualTo(400);
+            assertThat(new com.fasterxml.jackson.databind.ObjectMapper()
+                    .readTree(badResponse.getEntity().getContent()).get("error").asText()).isEqualTo("Bad response for bad request");
         }
     }
 
@@ -91,6 +110,15 @@ public class Part01_DifferentWaysOfCallingApis extends TestWithMockServer {
         var asObject = new com.fasterxml.jackson.databind.ObjectMapper()
                 .readValue(response.body().string(), SampleResponseModel.class);
         assertThat(asObject).isEqualTo(new SampleResponseModel("John", 25));
+
+        // now making the call to the bad-req endpoint
+        okhttp3.Request badRequest = new okhttp3.Request.Builder()
+                .url("http://localhost:1090/bad-req-endpoint")
+                .build();
+        okhttp3.Response badResponse = client.newCall(badRequest).execute();
+        assertThat(badResponse.code()).isEqualTo(400);
+        assertThat(new com.fasterxml.jackson.databind.ObjectMapper()
+                .readTree(badResponse.body().string()).get("error").asText()).isEqualTo("Bad response for bad request");
     }
 
     @Test
@@ -98,6 +126,9 @@ public class Part01_DifferentWaysOfCallingApis extends TestWithMockServer {
         interface RemoteRetrofitService {
             @retrofit2.http.GET("/some-endpoint")
             retrofit2.Call<SampleResponseModel> getOurDomainModel();
+
+            @retrofit2.http.GET("/bad-req-endpoint")
+            retrofit2.Call<SampleResponseModel> getBadResponse();
         }
 
         retrofit2.Retrofit retrofit = new retrofit2.Retrofit.Builder()
@@ -109,6 +140,11 @@ public class Part01_DifferentWaysOfCallingApis extends TestWithMockServer {
         retrofit2.Response<SampleResponseModel> response = call.execute();
         assertThat(response.code()).isEqualTo(200);
         assertThat(response.body()).isEqualTo(new SampleResponseModel("John", 25));
+
+        // non-ok responses still need to be handled
+        retrofit2.Call<SampleResponseModel> badCall = service.getBadResponse();
+        retrofit2.Response<SampleResponseModel> badResponse = badCall.execute();
+        assertThat(badResponse.code()).isEqualTo(400);
     }
 
     @Test
@@ -119,6 +155,17 @@ public class Part01_DifferentWaysOfCallingApis extends TestWithMockServer {
                     .get(SampleResponseModel.class);
 
             assertThat(response).isEqualTo(new SampleResponseModel("John", 25));
+
+            // making the call to the bad-req endpoint will throw  jakarta.ws.rs.BadRequestException
+            Assertions.assertThatExceptionOfType(
+                            jakarta.ws.rs.BadRequestException.class
+                    ).isThrownBy(
+                            () -> client.target("http://localhost:1090/bad-req-endpoint")
+                                    .request()
+                                    .get(ErrorResponseModel.class)
+                    ).withMessage("HTTP 400 Bad Request")
+                    .extracting(e -> e.getResponse().readEntity(ErrorResponseModel.class))
+                    .isEqualTo(new ErrorResponseModel("Bad response for bad request"));
         }
     }
 
@@ -131,6 +178,10 @@ public class Part01_DifferentWaysOfCallingApis extends TestWithMockServer {
             @GET
             @Path("/some-endpoint")
             SampleResponseModel getOurDomainModel();
+
+            @GET
+            @Path("/bad-req-endpoint")
+            SampleResponseModel getBadResponse();
         }
 
         var target = jakarta.ws.rs.client.ClientBuilder.newClient().target("http://localhost:1090");
@@ -140,6 +191,15 @@ public class Part01_DifferentWaysOfCallingApis extends TestWithMockServer {
         SampleResponseModel response = ourServiceProxy.getOurDomainModel();
 
         assertThat(response).isEqualTo(new SampleResponseModel("John", 25));
+
+        // making the call to the bad-req endpoint will throw  jakarta.ws.rs.BadRequestException
+        Assertions.assertThatExceptionOfType(
+                        jakarta.ws.rs.BadRequestException.class
+                ).isThrownBy(
+                        () -> ourServiceProxy.getBadResponse()
+                ).withMessage("HTTP 400 Bad Request")
+                .extracting(e -> e.getResponse().readEntity(ErrorResponseModel.class))
+                .isEqualTo(new ErrorResponseModel("Bad response for bad request"));
     }
 
 }
