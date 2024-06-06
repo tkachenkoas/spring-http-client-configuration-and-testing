@@ -57,7 +57,7 @@ Java has a number of libraries to make HTTP calls. Here are some of them:
 - `java.net.HttpURLConnection` - the standard JDK means for making HTTP calls.
   it's unlikely that you will use it in a modern application, but some legacy
   applications might still use it.
-- Java 11 HttpClient — a new addition to the JDK. It's a modern and flexible
+- `Java 11 HttpClient` — a new addition to the JDK. It's a modern and flexible
   solution
 - Apache HttpClient (```org.apache.httpcomponents.client5:httpclient5```) - a popular library that has been around for a
   long time
@@ -260,19 +260,29 @@ you can see that it adds more abstractions over the HTTP protocol (like `Closeab
 
 ```
     @Test
-    void withOkHttp() throws Exception {
-        var client = new OkHttpClient();
-        var request = new Request.Builder()
+    void withOkHttpClient() throws Exception {
+        OkHttpClient client = new okhttp3.OkHttpClient();
+
+        okhttp3.Request request = new okhttp3.Request.Builder()
                 .url("http://localhost:1090/some-endpoint")
                 .addHeader("Accept", "application/json")
                 .build();
-        Response response = client.newCall(request).execute();
+
+        okhttp3.Response response = client.newCall(request).execute();
         assertThat(response.code()).isEqualTo(200);
 
         var asObject = new com.fasterxml.jackson.databind.ObjectMapper()
                 .readValue(response.body().string(), SampleResponseModel.class);
-
         assertThat(asObject).isEqualTo(new SampleResponseModel("John", 25));
+
+        // now making the call to the bad-req endpoint
+        okhttp3.Request badRequest = new okhttp3.Request.Builder()
+                .url("http://localhost:1090/bad-req-endpoint")
+                .build();
+        okhttp3.Response badResponse = client.newCall(badRequest).execute();
+        assertThat(badResponse.code()).isEqualTo(400);
+        assertThat(new com.fasterxml.jackson.databind.ObjectMapper()
+                .readTree(badResponse.body().string()).get("error").asText()).isEqualTo("Bad response for bad request");
     }
 ```
 

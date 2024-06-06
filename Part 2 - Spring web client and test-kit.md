@@ -33,6 +33,51 @@ use the "native" client if you need - but you will lose the convenience and the 
 In my opinion, whenever you need to work with some external system, you should first check if Spring has a `Template` for 
 it, and only then consider using a "native" client.
 
+```
+
+/**
+     * YYYTemplate and YYYOperations are common names for classes that encapsulate the operations
+     * with a specific service. For example:
+     */
+    RestOperations restOperationsIsAnInterfaceForMakingHttpRequests;
+
+
+    /**
+     * In data-jpa world, we have JdbcOperations and NamedParameterJdbcOperations and their implementations
+     */
+    JdbcOperations jdbcOperations;
+
+    NamedParameterJdbcOperations namedParameterJdbcOperations;
+
+    JdbcTemplate jdbcTemplate;
+
+    NamedParameterJdbcTemplate namedParameterJdbcTemplate;
+
+    /**
+     * Alternative to {@link org.springframework.transaction.annotation.Transactional}
+     */
+    TransactionOperations transactionOperations;
+
+    TransactionTemplate transactionTemplate;
+
+    /**
+     * Mongo and redis have their own templates.
+     */
+
+    MongoOperations mongoOperations;
+
+    MongoTemplate mongoTemplate;
+
+    /**
+     * <K> – the Redis key type against which the template works (usually a String)
+     * <V> – the Redis value type against which the template works
+     */
+    RedisOperations<String, String> redisOperations;
+
+    RedisTemplate<String, String> redisTemplate;
+
+```
+
 ### But RestTemplate is deprecated! Don't you know how to google?
 
 Well, as of the date of writing this article, `RestTemplate` is not deprecated. It's true that Spring 6.1 / Spring Boot 3.2 
@@ -133,9 +178,9 @@ parameters. As you can see, this api satisfies the criteria of
                         .withBody("{\"name\":\"John\",\"age\":25}")
         );
 
-        String urkWithTemplate = "http://localhost:1090/some-endpoint/{name}?age={age}";
+        String urlWithTemplate = "http://localhost:1090/some-endpoint/{name}?age={age}";
         SampleResponseModel someResponse = restTemplate.postForObject(
-                urkWithTemplate, new SampleResponseModel("John", 25),
+                urlWithTemplate, new SampleResponseModel("John", 25),
                 SampleResponseModel.class,
                 "John", 25
         );

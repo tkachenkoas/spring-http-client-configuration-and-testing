@@ -116,9 +116,9 @@ class Part02_01_TemplateOperationsFamily extends TestWithMockServer {
                         .withBody("{\"name\":\"John\",\"age\":25}")
         );
 
-        String urkWithTemplate = "http://localhost:1090/some-endpoint/{name}?age={age}";
+        String urlWithTemplate = "http://localhost:1090/some-endpoint/{name}?age={age}";
         SampleResponseModel someResponse = restTemplate.postForObject(
-                urkWithTemplate, new SampleResponseModel("John", 25),
+                urlWithTemplate, new SampleResponseModel("John", 25),
                 SampleResponseModel.class,
                 "John", 25
         );
@@ -205,7 +205,7 @@ class Part02_01_TemplateOperationsFamily extends TestWithMockServer {
 
 
     /**
-     * In data-jpa world,
+     * In data-jpa world, we have JdbcOperations and NamedParameterJdbcOperations and their implementations
      */
     JdbcOperations jdbcOperations;
 
